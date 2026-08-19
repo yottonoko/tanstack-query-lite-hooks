@@ -1,0 +1,9 @@
+import type { DefaultError, DefinedInitialDataInfiniteOptions, DefinedUseInfiniteQueryResult, InfiniteData, QueryClient, QueryKey, UndefinedInitialDataInfiniteOptions, UseInfiniteQueryOptions, UseInfiniteQueryResult, UseSuspenseInfiniteQueryOptions, UseSuspenseInfiniteQueryResult } from "@tanstack/react-query";
+/** Infinite Query を observer なしで購読します。 */
+export declare function useInfiniteQueryLite<TQueryFnData, TError = DefaultError, TData = InfiniteData<TQueryFnData>, TQueryKey extends QueryKey = QueryKey, TPageParam = unknown>(options: DefinedInitialDataInfiniteOptions<TQueryFnData, TError, TData, TQueryKey, TPageParam>, queryClient?: QueryClient): DefinedUseInfiniteQueryResult<TData, TError>;
+/** Infinite Query を observer なしで購読します。 */
+export declare function useInfiniteQueryLite<TQueryFnData, TError = DefaultError, TData = InfiniteData<TQueryFnData>, TQueryKey extends QueryKey = QueryKey, TPageParam = unknown>(options: UndefinedInitialDataInfiniteOptions<TQueryFnData, TError, TData, TQueryKey, TPageParam>, queryClient?: QueryClient): UseInfiniteQueryResult<TData, TError>;
+/** Infinite Query を observer なしで購読します。 */
+export declare function useInfiniteQueryLite<TQueryFnData, TError = DefaultError, TData = InfiniteData<TQueryFnData>, TQueryKey extends QueryKey = QueryKey, TPageParam = unknown>(options: UseInfiniteQueryOptions<TQueryFnData, TError, TData, TQueryKey, TPageParam>, queryClient?: QueryClient): UseInfiniteQueryResult<TData, TError>;
+/** Infinite Query を Suspense で取得し、定義済み data を返します。 */
+export declare function useSuspenseInfiniteQueryLite<TQueryFnData, TError = DefaultError, TData = InfiniteData<TQueryFnData>, TQueryKey extends QueryKey = QueryKey, TPageParam = unknown>(options: UseSuspenseInfiniteQueryOptions<TQueryFnData, TError, TData, TQueryKey, TPageParam>, queryClient?: QueryClient): UseSuspenseInfiniteQueryResult<TData, TError>;

@@ -1,0 +1,62 @@
+{
+  "name": "tanstack-query-lite-hooks",
+  "version": "0.1.0",
+  "description": "Observer-free React hooks backed by the real TanStack Query cache.",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "default": "./dist/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup && tsc -p tsconfig.build.json && pnpm check:declarations && pnpm check:bundle",
+    "check": "pnpm typecheck && pnpm lint && pnpm test && pnpm check:react-compiler && pnpm build",
+    "check:bundle": "node scripts/check-bundle.mjs",
+    "check:declarations": "tsc --ignoreConfig --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --skipLibCheck false scripts/type-consumer.ts",
+    "check:react-compiler": "node scripts/check-react-compiler.mjs",
+    "lint": "oxlint src tests benchmarks scripts --deny-warnings",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "bench:compare": "node benchmarks/runner.mjs",
+    "bench:memory": "node benchmarks/memory-runner.mjs"
+  },
+  "peerDependencies": {
+    "@tanstack/react-query": ">=5.101.0 <5.102.0",
+    "react": ">=18.3.0 <20",
+    "react-dom": ">=18.3.0 <20"
+  },
+  "devDependencies": {
+    "@babel/core": "7.28.6",
+    "@tanstack/react-query": "5.101.4",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "26.2.0",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "babel-plugin-react-compiler": "1.0.0",
+    "esbuild": "0.27.7",
+    "jsdom": "30.0.1",
+    "oxlint": "1.78.0",
+    "playwright": "1.62.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "swr": "2.5.1",
+    "tsup": "8.5.1",
+    "typescript": "7.0.2",
+    "vite": "8.2.1",
+    "vitest": "4.1.10"
+  }
+}
