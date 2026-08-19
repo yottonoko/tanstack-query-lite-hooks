@@ -1,9 +1,12 @@
 import {
   focusManager,
+  matchQuery,
   onlineManager,
 } from '@tanstack/react-query'
 import type {
   DefaultError,
+  InvalidateOptions,
+  InvalidateQueryFilters,
   Query,
   QueryCache,
   QueryCacheNotifyEvent,
@@ -44,6 +47,10 @@ export interface LiteIntervalEntry {
 
 interface RetainedQuery {
   leases: number
+}
+
+interface SharedRetainedQuery {
+  leases: number
   gcTime: number
 }
 
@@ -58,7 +65,326 @@ interface ScheduledTimer {
 }
 
 const hubs = new WeakMap<QueryClient, LiteHub>()
+type InvalidationRefetchType = 'active' | 'inactive' | 'all' | 'none'
+
+interface InvalidationContext {
+  readonly filters: InvalidateQueryFilters | undefined
+  readonly refetchType: InvalidationRefetchType
+  readonly cancelRefetch: boolean
+  readonly throwOnError: boolean
+  readonly rawRefetches: Map<AnyLiteQuery, Promise<unknown>>
+  readonly refetches: Map<AnyLiteQuery, Promise<unknown>>
+  synchronous: boolean
+}
+
+interface InvalidationPatch {
+  wrapper: QueryClient['invalidateQueries']
+}
+
+const invalidationPatches = new WeakMap<QueryClient, InvalidationPatch>()
+const invalidationContexts = new WeakMap<QueryCache, InvalidationContext[]>()
+interface LiteQuerySemantics {
+  readonly isActive: () => boolean
+  readonly isStatic: () => boolean
+  readonly mayBeStatic?: boolean
+}
+
+interface LiteQueryMethodPatch {
+  readonly cache: QueryCache
+  readonly activeDescriptor: PropertyDescriptor | undefined
+  readonly disabledDescriptor: PropertyDescriptor | undefined
+  readonly nativeIsActive: AnyLiteQuery['isActive']
+  readonly nativeIsDisabled: AnyLiteQuery['isDisabled']
+  staticDescriptor: PropertyDescriptor | undefined
+  nativeIsStatic: AnyLiteQuery['isStatic'] | undefined
+  staticInstalled: boolean
+}
+
+const liteQueryLeases = new WeakMap<
+  QueryCache,
+  Map<AnyLiteQuery, Map<object, LiteQuerySemantics>>
+>()
+const liteQueryLeaseOwners = new WeakMap<
+  object,
+  { cache: QueryCache; query: AnyLiteQuery }
+>()
+const liteQueryMethodPatches = new WeakMap<AnyLiteQuery, LiteQueryMethodPatch>()
+// QueryClient が異なっても同じ QueryCache/Query を使う場合は lease を共有する。
+const sharedRetainedQueries = new WeakMap<
+  QueryCache,
+  Map<AnyLiteQuery, SharedRetainedQuery>
+>()
 const MAX_TIMER_DELAY = 2_147_483_647
+
+function queryLeases(
+  cache: QueryCache,
+  query: AnyLiteQuery,
+): Map<object, LiteQuerySemantics> | undefined {
+  return liteQueryLeases.get(cache)?.get(query)
+}
+
+function isLiteActive(cache: QueryCache, query: AnyLiteQuery): boolean {
+  for (const semantics of queryLeases(cache, query)?.values() ?? []) {
+    if (semantics.isActive()) return true
+  }
+  return false
+}
+
+function isLiteStatic(cache: QueryCache, query: AnyLiteQuery): boolean {
+  for (const semantics of queryLeases(cache, query)?.values() ?? []) {
+    if (semantics.isStatic()) return true
+  }
+  return false
+}
+
+function restoreQueryMethod(
+  query: AnyLiteQuery,
+  name: 'isActive' | 'isDisabled' | 'isStatic',
+  descriptor: PropertyDescriptor | undefined,
+): void {
+  if (descriptor) Object.defineProperty(query, name, descriptor)
+  else Reflect.deleteProperty(query, name)
+}
+
+function restoreQueryMethods(query: AnyLiteQuery): void {
+  const patch = liteQueryMethodPatches.get(query)
+  if (!patch) return
+  restoreQueryMethod(query, 'isActive', patch.activeDescriptor)
+  restoreQueryMethod(query, 'isDisabled', patch.disabledDescriptor)
+  if (patch.staticInstalled) {
+    restoreQueryMethod(query, 'isStatic', patch.staticDescriptor)
+  }
+  liteQueryMethodPatches.delete(query)
+}
+
+function liteQueryIsActive(this: AnyLiteQuery): boolean {
+  const patch = liteQueryMethodPatches.get(this)!
+  return patch.nativeIsActive.call(this) || isLiteActive(patch.cache, this)
+}
+
+function liteQueryIsDisabled(this: AnyLiteQuery): boolean {
+  const patch = liteQueryMethodPatches.get(this)!
+  if ((queryLeases(patch.cache, this)?.size ?? 0) > 0) {
+    return !liteQueryIsActive.call(this)
+  }
+  return patch.nativeIsDisabled.call(this)
+}
+
+function liteQueryIsStatic(this: AnyLiteQuery): boolean {
+  const patch = liteQueryMethodPatches.get(this)!
+  return patch.nativeIsStatic!.call(this) || isLiteStatic(patch.cache, this)
+}
+
+function installStaticQueryMethod(
+  query: AnyLiteQuery,
+  patch: LiteQueryMethodPatch,
+): void {
+  if (patch.staticInstalled) return
+  const descriptor = Object.getOwnPropertyDescriptor(query, 'isStatic')
+  if (!descriptor && !Object.isExtensible(query)) {
+    throw new TypeError(
+      '[tanstack-query-lite-hooks] Query semantic methods cannot be installed on a non-extensible Query.',
+    )
+  }
+  if (descriptor && descriptor.configurable !== true) {
+    throw new TypeError(
+      '[tanstack-query-lite-hooks] Query semantic methods require configurable own method descriptors.',
+    )
+  }
+  const nativeIsStatic = query.isStatic
+  try {
+    Object.defineProperty(query, 'isStatic', {
+      configurable: true,
+      writable: true,
+      value: liteQueryIsStatic,
+    })
+  } catch (error) {
+    restoreQueryMethod(query, 'isStatic', descriptor)
+    throw error
+  }
+  patch.staticDescriptor = descriptor
+  patch.nativeIsStatic = nativeIsStatic
+  patch.staticInstalled = true
+}
+
+function ensureQueryMethods(
+  cache: QueryCache,
+  query: AnyLiteQuery,
+  includeStatic: boolean,
+): void {
+  const current = liteQueryMethodPatches.get(query)
+  if (current) {
+    if (includeStatic) installStaticQueryMethod(query, current)
+    return
+  }
+  const patch: LiteQueryMethodPatch = {
+    cache,
+    activeDescriptor: Object.getOwnPropertyDescriptor(query, 'isActive'),
+    disabledDescriptor: Object.getOwnPropertyDescriptor(query, 'isDisabled'),
+    nativeIsActive: query.isActive,
+    nativeIsDisabled: query.isDisabled,
+    staticDescriptor: undefined,
+    nativeIsStatic: undefined,
+    staticInstalled: false,
+  }
+  if (
+    (!patch.activeDescriptor || !patch.disabledDescriptor) &&
+    !Object.isExtensible(query)
+  ) {
+    throw new TypeError(
+      '[tanstack-query-lite-hooks] Query semantic methods cannot be installed on a non-extensible Query.',
+    )
+  }
+  if (
+    (patch.activeDescriptor && patch.activeDescriptor.configurable !== true) ||
+    (patch.disabledDescriptor && patch.disabledDescriptor.configurable !== true)
+  ) {
+    throw new TypeError(
+      '[tanstack-query-lite-hooks] Query semantic methods require configurable own method descriptors.',
+    )
+  }
+  try {
+    Object.defineProperties(query, {
+      isActive: {
+        configurable: true,
+        writable: true,
+        value: liteQueryIsActive,
+      },
+      isDisabled: {
+        configurable: true,
+        writable: true,
+        value: liteQueryIsDisabled,
+      },
+    })
+  } catch (error) {
+    restoreQueryMethod(query, 'isActive', patch.activeDescriptor)
+    restoreQueryMethod(query, 'isDisabled', patch.disabledDescriptor)
+    throw error
+  }
+  liteQueryMethodPatches.set(query, patch)
+  if (includeStatic) {
+    try {
+      installStaticQueryMethod(query, patch)
+    } catch (error) {
+      restoreQueryMethod(query, 'isActive', patch.activeDescriptor)
+      restoreQueryMethod(query, 'isDisabled', patch.disabledDescriptor)
+      liteQueryMethodPatches.delete(query)
+      throw error
+    }
+  }
+}
+
+function clearLiteQueryLease(lease: object): void {
+  const owner = liteQueryLeaseOwners.get(lease)
+  if (!owner) return
+  const queries = liteQueryLeases.get(owner.cache)
+  const leases = queries?.get(owner.query)
+  leases?.delete(lease)
+  if (leases?.size === 0) {
+    queries?.delete(owner.query)
+    restoreQueryMethods(owner.query)
+  }
+  if (queries?.size === 0) liteQueryLeases.delete(owner.cache)
+  liteQueryLeaseOwners.delete(lease)
+}
+
+function setLiteQueryLease(
+  cache: QueryCache,
+  query: AnyLiteQuery,
+  lease: object,
+  semantics: LiteQuerySemantics,
+): void {
+  ensureQueryMethods(
+    cache,
+    query,
+    semantics.mayBeStatic === true,
+  )
+  const owner = liteQueryLeaseOwners.get(lease)
+  if (owner && (owner.cache !== cache || owner.query !== query)) {
+    clearLiteQueryLease(lease)
+  }
+  let queries = liteQueryLeases.get(cache)
+  if (!queries) {
+    queries = new Map()
+    liteQueryLeases.set(cache, queries)
+  }
+  let leases = queries.get(query)
+  if (!leases) {
+    leases = new Map()
+    queries.set(query, leases)
+  }
+  leases.set(lease, semantics)
+  liteQueryLeaseOwners.set(lease, { cache, query })
+}
+
+function installInvalidationTracking(
+  client: QueryClient,
+  cache: QueryCache,
+): void {
+  if (invalidationPatches.has(client)) return
+  const initialImplementation = client.invalidateQueries
+  const patch: InvalidationPatch = {
+    wrapper: undefined as unknown as QueryClient['invalidateQueries'],
+  }
+  const createTrackedInvalidate = (
+    implementation: QueryClient['invalidateQueries'],
+  ): QueryClient['invalidateQueries'] => {
+    const trackedInvalidate = (
+      filters?: InvalidateQueryFilters,
+      options?: InvalidateOptions,
+    ): Promise<void> => {
+      const context: InvalidationContext = {
+        filters,
+        refetchType: filters?.refetchType ?? filters?.type ?? 'active',
+        cancelRefetch: options?.cancelRefetch ?? true,
+        throwOnError: options?.throwOnError === true,
+        rawRefetches: new Map(),
+        refetches: new Map(),
+        synchronous: true,
+      }
+      let stack = invalidationContexts.get(cache)
+      if (!stack) {
+        stack = []
+        invalidationContexts.set(cache, stack)
+      }
+      stack.push(context)
+      let nativePromise: Promise<void>
+      try {
+        nativePromise = implementation.call(client, filters, options)
+      } catch (error) {
+        const index = stack.lastIndexOf(context)
+        if (index !== -1) stack.splice(index, 1)
+        if (stack.length === 0) invalidationContexts.delete(cache)
+        throw error
+      } finally {
+        context.synchronous = false
+      }
+      return nativePromise
+        .then(() => Promise.all(context.refetches.values()))
+        .then(() => undefined)
+        .finally(() => {
+          const index = stack.lastIndexOf(context)
+          if (index !== -1) stack.splice(index, 1)
+          if (stack.length === 0) invalidationContexts.delete(cache)
+        })
+    }
+    return trackedInvalidate as QueryClient['invalidateQueries']
+  }
+  patch.wrapper = createTrackedInvalidate(initialImplementation)
+  Object.defineProperty(client, 'invalidateQueries', {
+    configurable: true,
+    enumerable: false,
+    get: () => patch.wrapper,
+    set: (implementation: QueryClient['invalidateQueries']) => {
+      if (implementation === patch.wrapper) return
+      if (typeof implementation !== 'function') {
+        throw new TypeError('QueryClient.invalidateQueries must be a function')
+      }
+      patch.wrapper = createTrackedInvalidate(implementation)
+    },
+  })
+  invalidationPatches.set(client, patch)
+}
 
 function delayUntil(deadline: number): number {
   return Math.min(Math.max(deadline - Date.now(), 0), MAX_TIMER_DELAY)
@@ -83,6 +409,91 @@ function clearQueryGcTimeout(query: AnyLiteQuery): void {
     )
   }
   candidate.clearGcTimeout()
+}
+
+function sharedRetentionMap(
+  cache: QueryCache,
+): Map<AnyLiteQuery, SharedRetainedQuery> {
+  let retained = sharedRetainedQueries.get(cache)
+  if (!retained) {
+    retained = new Map()
+    sharedRetainedQueries.set(cache, retained)
+  }
+  return retained
+}
+
+function extendGcTime(
+  retained: SharedRetainedQuery,
+  gcTime: number | undefined,
+): void {
+  if (gcTime === Infinity) {
+    retained.gcTime = Infinity
+  } else if (validTimeout(gcTime)) {
+    retained.gcTime = Math.max(retained.gcTime, gcTime)
+  }
+}
+
+function retainSharedQuery(
+  cache: QueryCache,
+  query: AnyLiteQuery,
+  gcTime: number | undefined,
+): void {
+  const initialGcTime = queryGcTime(query)
+  const previousGcTime = query.gcTime
+  query.gcTime = Infinity
+  try {
+    clearQueryGcTimeout(query)
+  } catch (error) {
+    query.gcTime = previousGcTime
+    throw error
+  }
+  const retainedQueries = sharedRetentionMap(cache)
+  let retained = retainedQueries.get(query)
+  if (!retained) {
+    retained = { leases: 0, gcTime: initialGcTime }
+    retainedQueries.set(query, retained)
+  }
+  extendGcTime(retained, gcTime)
+  retained.leases += 1
+}
+
+function noteSharedGcTime(
+  cache: QueryCache,
+  query: AnyLiteQuery,
+  gcTime: number | undefined,
+): void {
+  const retained = sharedRetainedQueries.get(cache)?.get(query)
+  if (retained) extendGcTime(retained, gcTime)
+}
+
+function releaseSharedQuery(
+  cache: QueryCache,
+  query: AnyLiteQuery,
+  gcTime: number | undefined,
+): { remaining: boolean; gcTime: number } | undefined {
+  const retainedQueries = sharedRetainedQueries.get(cache)
+  const retained = retainedQueries?.get(query)
+  if (!retained) return undefined
+  extendGcTime(retained, gcTime)
+  retained.leases -= 1
+  if (retained.leases > 0) {
+    query.gcTime = Infinity
+    return { remaining: true, gcTime: retained.gcTime }
+  }
+  retainedQueries!.delete(query)
+  query.gcTime = retained.gcTime
+  return { remaining: false, gcTime: retained.gcTime }
+}
+
+function isSharedQueryRetained(
+  cache: QueryCache,
+  query: AnyLiteQuery,
+): boolean {
+  return (sharedRetainedQueries.get(cache)?.get(query)?.leases ?? 0) > 0
+}
+
+function forgetSharedQuery(cache: QueryCache, query: AnyLiteQuery): void {
+  sharedRetainedQueries.get(cache)?.delete(query)
 }
 
 /**
@@ -125,8 +536,51 @@ export class LiteHub {
     this.cache = client.getQueryCache()
   }
 
+  /** QueryClient の active invalidate に Lite-only refetch を合流する。 */
+  runActiveInvalidation(
+    query: AnyLiteQuery,
+    fetch: (options: LiteFetchOptions) => Promise<unknown>,
+  ): boolean | undefined {
+    const contexts = invalidationContexts.get(this.cache)
+    if (!contexts) return undefined
+    let synchronous: InvalidationContext | undefined
+    for (let index = contexts.length - 1; index >= 0; index -= 1) {
+      if (contexts[index]!.synchronous) {
+        synchronous = contexts[index]
+        break
+      }
+    }
+    const matching = synchronous
+      ? [synchronous]
+      : contexts.filter((context) => matchQuery(context.filters ?? {}, query))
+    if (matching.length === 0) return undefined
+    const active = matching.filter((context) => context.refetchType === 'active')
+    if (active.length === 0) return false
+    let request = active
+      .map((context) => context.rawRefetches.get(query))
+      .find((candidate) => candidate !== undefined)
+    if (!request) {
+      request = fetch({ cancelRefetch: active.at(-1)!.cancelRefetch })
+    }
+    for (const context of active) {
+      if (context.refetches.has(query)) continue
+      context.rawRefetches.set(query, request)
+      const tracked = context.throwOnError
+        ? request
+        : request.catch(() => undefined)
+      if (query.state.fetchStatus === 'paused') {
+        void tracked.catch(() => undefined)
+        context.refetches.set(query, Promise.resolve())
+      } else {
+        context.refetches.set(query, tracked)
+      }
+    }
+    return true
+  }
+
   /** キャッシュへの実購読は Hub ごとに最大一つだけ作る */
   private ensureExternalSubscriptions(): void {
+    installInvalidationTracking(this.client, this.cache)
     if (!this.cacheUnsubscribe) {
       this.cacheUnsubscribe = this.cache.subscribe((event) => {
         this.onCacheEvent(event)
@@ -232,6 +686,7 @@ export class LiteHub {
     if (event.type === 'removed') {
       this.gcCandidates.delete(query)
       this.retained.delete(query)
+      forgetSharedQuery(this.cache, query)
     }
 
     const listeners = this.hashListeners.get(hash)
@@ -267,7 +722,9 @@ export class LiteHub {
       TQueryKey
     > & { queryKey: TQueryKey },
   ): Query<TQueryFnData, TError, TData, TQueryKey> {
-    const defaulted = this.client.defaultQueryOptions(options)
+    const defaulted = (options as { _defaulted?: boolean })._defaulted === true
+      ? options
+      : this.client.defaultQueryOptions(options)
     return this.cache.build(this.client, defaulted)
   }
 
@@ -281,19 +738,12 @@ export class LiteHub {
   }
 
   retain(query: AnyLiteQuery, gcTime?: number): void {
+    installInvalidationTracking(this.client, this.cache)
+    retainSharedQuery(this.cache, query, gcTime)
     let retained = this.retained.get(query)
     if (!retained) {
-      retained = {
-        leases: 0,
-        gcTime: queryGcTime(query),
-      }
+      retained = { leases: 0 }
       this.retained.set(query, retained)
-    }
-
-    if (validTimeout(gcTime)) {
-      retained.gcTime = Math.max(retained.gcTime, gcTime)
-    } else if (gcTime === Infinity) {
-      retained.gcTime = Infinity
     }
     retained.leases++
     this.gcCandidates.delete(query)
@@ -302,34 +752,41 @@ export class LiteHub {
       this.gcTimer = undefined
       this.gcTimerDeadline = undefined
     }
-    clearQueryGcTimeout(query)
-    query.gcTime = Infinity
   }
 
   noteGcTime(query: AnyLiteQuery, gcTime: number | undefined): void {
     const retained = this.retained.get(query)
     if (!retained || gcTime === undefined) return
-    retained.gcTime = gcTime === Infinity
-      ? Infinity
-      : Math.max(retained.gcTime, gcTime)
+    noteSharedGcTime(this.cache, query, gcTime)
+  }
+
+  /** commit 済み Lite subscription の active/static 判定を共有する。 */
+  setQuerySemantics(
+    query: AnyLiteQuery,
+    lease: object,
+    semantics: LiteQuerySemantics,
+  ): void {
+    setLiteQueryLease(this.cache, query, lease, semantics)
+  }
+
+  /** この subscription が保持していた active/static 判定を解除する。 */
+  clearQuerySemantics(lease: object): void {
+    const owner = liteQueryLeaseOwners.get(lease)
+    if (owner?.cache !== this.cache) return
+    clearLiteQueryLease(lease)
   }
 
   release(query: AnyLiteQuery): void {
     const retained = this.retained.get(query)
     if (!retained) return
     retained.leases--
+    const optionGcTime = query.options.gcTime
+    const shared = releaseSharedQuery(this.cache, query, optionGcTime)
     if (retained.leases > 0) return
 
-    const optionGcTime = query.options.gcTime
-    if (typeof optionGcTime === 'number') {
-      retained.gcTime = optionGcTime === Infinity
-        ? Infinity
-        : Math.max(retained.gcTime, optionGcTime)
-    }
     this.retained.delete(query)
-    query.gcTime = retained.gcTime
-    if (query.getObserversCount() === 0) {
-      this.scheduleReleasedQuery(query, retained.gcTime)
+    if (shared && !shared.remaining && query.getObserversCount() === 0) {
+      this.scheduleReleasedQuery(query, shared.gcTime)
     }
     this.maybeReleaseExternalSubscriptions()
   }
@@ -349,6 +806,10 @@ export class LiteHub {
 
   private flushGcCandidate(candidate: GcCandidate): void {
     const { query } = candidate
+    if (isSharedQueryRetained(this.cache, query)) {
+      this.gcCandidates.delete(query)
+      return
+    }
     if (this.retained.has(query)) {
       this.gcCandidates.delete(query)
       return
@@ -515,7 +976,9 @@ export class LiteHub {
 
   destroy(): void {
     for (const [query, retained] of this.retained) {
-      query.gcTime = retained.gcTime
+      for (let lease = 0; lease < retained.leases; lease += 1) {
+        releaseSharedQuery(this.cache, query, query.options.gcTime)
+      }
     }
     this.cacheUnsubscribe?.()
     this.cacheUnsubscribe = undefined

@@ -48,6 +48,11 @@ type AnyQueryOptions = QueryObserverOptions<any, any, any, any, any> & {
 }
 type AnyQueryResult = QueryObserverResult<any, any>
 type AnyQuery = AnyLiteQuery
+interface LiteSelectMemory {
+  selectFn: ((data: any) => any) | undefined
+  selectResult: any
+  selectError: unknown | null
+}
 const pausedSuspensePromise = new Promise<never>(() => undefined)
 
 function resolveBoolean(value: unknown, query: AnyQuery): boolean | undefined {
@@ -123,7 +128,9 @@ class LiteQueryEntry {
   readonly hash: string
   queryInitialState: AnyQuery['state']
   readonly trackedProps = new Set<PropertyKey>()
-  readonly selectState: { selectFn?: (data: any) => any; selectResult?: any; selectError: unknown | null } = {
+  readonly selectState: LiteSelectMemory = {
+    selectFn: undefined,
+    selectResult: undefined,
     selectError: null,
   }
 
@@ -143,8 +150,22 @@ class LiteQueryEntry {
   private hasCommit = false
   private staleTimerKey = {}
   private intervalTimerKey = {}
+  private querySemanticsKey = {}
   private isRestoring = false
+  // 未 commit の concurrent render が live subscription の callback を置き換えないよう分離する。
+  private committedOptions: AnyQueryOptions
+  private committedIsRestoring = false
+  private committedRawResult: AnyQueryResult | undefined
+  private committedPreviousResultState: AnyQuery['state'] | undefined
+  private committedPreviousResultOptions: AnyQueryOptions | undefined
+  private committedLastQueryWithDefinedData: AnyQuery | undefined
+  private readonly committedSelectState: LiteSelectMemory = {
+    selectFn: undefined,
+    selectResult: undefined,
+    selectError: null,
+  }
   private rebinding = false
+  private invalidationFetchScheduled = false
 
   constructor(
     client: QueryClient,
@@ -156,13 +177,18 @@ class LiteQueryEntry {
     this.client = client
     this.hub = hub
     this.options = options
+    this.committedOptions = options
     this.query = query ?? hub.buildQuery(options)
     this.hash = this.query.queryHash
     this.queryInitialState = this.query.state
-    this.previousResult = previous?.rawResult
+    this.previousResult = previous?.committedRawResult ?? previous?.rawResult
     this.previousResultState = previous?.query.state
     this.previousResultOptions = previous?.options
     this.lastQueryWithDefinedData = previous?.query.state.data === undefined ? undefined : previous.query
+    this.committedRawResult = previous?.committedRawResult
+    this.committedPreviousResultState = previous?.committedPreviousResultState
+    this.committedPreviousResultOptions = previous?.committedPreviousResultOptions
+    this.committedLastQueryWithDefinedData = previous?.committedLastQueryWithDefinedData
   }
 
   update(options: AnyQueryOptions, isRestoring = false): void {
@@ -178,24 +204,65 @@ class LiteQueryEntry {
     const previousQuery = this.query
     this.previousResultState = previousQuery.state
     if (previousQuery.state.data !== undefined) this.lastQueryWithDefinedData = previousQuery
-    if (this.lease) this.hub.release(previousQuery)
+    if (this.lease) {
+      try {
+        this.hub.clearQuerySemantics(this.querySemanticsKey)
+      } finally {
+        this.hub.release(previousQuery)
+      }
+    }
     this.query = query
     this.queryInitialState = query.state
     this.currentPromise = undefined
     this.rawResult = undefined
     this.trackedResult = undefined
+    this.committedRawResult = undefined
+    this.committedPreviousResultState = previousQuery.state
+    this.committedPreviousResultOptions = this.committedOptions
+    this.committedLastQueryWithDefinedData =
+      previousQuery.state.data === undefined ? undefined : previousQuery
+    this.committedSelectState.selectFn = undefined
+    this.committedSelectState.selectResult = undefined
+    this.committedSelectState.selectError = null
     this.resultDirty = true
     this.autoFetchAttempted = false
     this.wasAutoFetchEligible = false
-    if (this.hasCommit) this.applyOptions()
-    if (this.lease) this.hub.retain(query, this.options.gcTime)
+    if (this.hasCommit) this.applyOptions(this.committedOptions)
+    if (this.lease) {
+      try {
+        this.updateQuerySemantics(query)
+        this.hub.retain(query, this.committedOptions.gcTime)
+      } catch (error) {
+        this.lease = false
+        this.hub.clearQuerySemantics(this.querySemanticsKey)
+        throw error
+      }
+    }
   }
 
-  private applyOptions(): void {
-    this.query.setOptions(this.options)
+  private applyOptions(options: AnyQueryOptions): void {
+    this.query.setOptions(options)
   }
 
-  private resultContext(): LiteResultContext<any, any, any, any, any> {
+  private updateQuerySemantics(query: AnyQuery = this.query): void {
+    this.hub.setQuerySemantics(query, this.querySemanticsKey, {
+      isActive: () =>
+        this.query === query &&
+        isEnabled(this.committedOptions, query) &&
+        !isSkipped(this.committedOptions),
+      isStatic: () =>
+        this.query === query &&
+        resolveStaleTime(this.committedOptions.staleTime, query) === 'static',
+      mayBeStatic:
+        typeof this.committedOptions.staleTime === 'function' ||
+        this.committedOptions.staleTime === 'static',
+    })
+  }
+
+  private resultContext(
+    options: AnyQueryOptions = this.options,
+    isRestoring = this.isRestoring,
+  ): LiteResultContext<any, any, any, any, any> {
     const fallback = this.query.state.data
     const promise = asPromise(
       this.currentPromise ?? this.query.promise,
@@ -203,19 +270,19 @@ class LiteQueryEntry {
     )
     const useOptimisticFetchState =
       !this.hasCommit &&
-      !this.isRestoring &&
-      this.options.subscribed !== false &&
+      !isRestoring &&
+      options.subscribed !== false &&
       this.query.state.status === 'pending' &&
       this.query.state.fetchStatus === 'idle' &&
-      isEnabled(this.options, this.query) &&
-      !isSkipped(this.options)
+      isEnabled(options, this.query) &&
+      !isSkipped(options)
     return {
       query: this.query,
       state: useOptimisticFetchState
         ? { ...this.query.state, fetchStatus: 'fetching' }
         : this.query.state,
       queryInitialState: this.queryInitialState,
-      options: this.options,
+      options,
       previousResult: this.rawResult,
       previousResultState: this.previousResultState,
       previousResultOptions: this.previousResultOptions,
@@ -226,10 +293,13 @@ class LiteQueryEntry {
     } as LiteResultContext<any, any, any, any, any>
   }
 
-  private computeResult(): AnyQueryResult {
-    const next = createLiteQueryResult(this.resultContext())
+  private computeResult(
+    options: AnyQueryOptions = this.options,
+    isRestoring = this.isRestoring,
+  ): AnyQueryResult {
+    const next = createLiteQueryResult(this.resultContext(options, isRestoring))
     this.previousResultState = this.query.state
-    this.previousResultOptions = this.options
+    this.previousResultOptions = options
     if (this.query.state.data !== undefined) this.lastQueryWithDefinedData = this.query
     this.rawResult = next
     return next
@@ -252,17 +322,66 @@ class LiteQueryEntry {
     return this.rawResult!
   }
 
+  private computeCommittedResult(): AnyQueryResult {
+    const fallback = this.query.state.data
+    const next = createLiteQueryResult({
+      query: this.query,
+      state: this.query.state,
+      queryInitialState: this.queryInitialState,
+      options: this.committedOptions,
+      previousResult: this.committedRawResult,
+      previousResultState: this.committedPreviousResultState,
+      previousResultOptions: this.committedPreviousResultOptions,
+      lastQueryWithDefinedData: this.committedLastQueryWithDefinedData,
+      selectState: this.committedSelectState,
+      refetch: this.refetch,
+      promise: asPromise(
+        this.currentPromise ?? this.query.promise,
+        fallback,
+      ),
+    } as LiteResultContext<any, any, any, any, any>)
+    this.committedRawResult = next
+    this.committedPreviousResultState = this.query.state
+    this.committedPreviousResultOptions = this.committedOptions
+    if (this.query.state.data !== undefined) {
+      this.committedLastQueryWithDefinedData = this.query
+    }
+    return next
+  }
+
+  private syncRenderResultFromCommitted(next: AnyQueryResult): void {
+    this.rawResult = next
+    this.previousResultState = this.committedPreviousResultState
+    this.previousResultOptions = this.committedPreviousResultOptions
+    this.lastQueryWithDefinedData = this.committedLastQueryWithDefinedData
+    this.selectState.selectFn = this.committedSelectState.selectFn
+    this.selectState.selectResult = this.committedSelectState.selectResult
+    this.selectState.selectError = this.committedSelectState.selectError
+  }
+
+  private commitRenderResult(): void {
+    if (!this.rawResult) return
+    this.committedRawResult = this.rawResult
+    this.committedPreviousResultState = this.previousResultState
+    this.committedPreviousResultOptions = this.previousResultOptions
+    this.committedLastQueryWithDefinedData = this.lastQueryWithDefinedData
+    this.committedSelectState.selectFn = this.selectState.selectFn
+    this.committedSelectState.selectResult = this.selectState.selectResult
+    this.committedSelectState.selectError = this.selectState.selectError
+  }
+
   private emitChanged(): boolean {
     this.resultDirty = true
-    const previous = this.rawResult
-    const next = this.computeResult()
+    const previous = this.committedRawResult
+    const next = this.computeCommittedResult()
+    this.syncRenderResultFromCommitted(next)
     this.resultDirty = false
     const changed = liteResultChanged(
       next as unknown as Record<string, unknown>,
       previous as unknown as Record<string, unknown> | undefined,
-      this.options.notifyOnChangeProps,
+      this.committedOptions.notifyOnChangeProps,
       this.trackedProps,
-      this.options.throwOnError,
+      this.committedOptions.throwOnError,
     )
     if (changed) {
       this.trackedResult = trackLiteResult(next, this.trackedProps, (key) => {
@@ -274,13 +393,14 @@ class LiteQueryEntry {
   }
 
   onCacheEvent(event: unknown): boolean {
+    const options = this.committedOptions
     const cacheEvent = event as { type?: string; query?: AnyQuery; action?: { type?: string } }
     if (cacheEvent.query && cacheEvent.query !== this.query) {
       this.rebind(cacheEvent.query)
     } else if (cacheEvent.type === 'removed' && !this.rebinding) {
       this.rebinding = true
       try {
-        this.rebind(this.hub.buildQuery(this.options))
+        this.rebind(this.hub.buildQuery(this.committedOptions))
       } finally {
         this.rebinding = false
       }
@@ -289,20 +409,59 @@ class LiteQueryEntry {
     if (
       action?.type === 'invalidate' &&
       this.hasCommit &&
-      !this.isRestoring &&
-      this.options.subscribed !== false &&
-      isEnabled(this.options, this.query) &&
-      !isSkipped(this.options)
+      !this.committedIsRestoring &&
+      options.subscribed !== false &&
+      isEnabled(options, this.query) &&
+      !isSkipped(options) &&
+      resolveStaleTime(options.staleTime, this.query) !== 'static' &&
+      !this.query.isActive()
     ) {
-      this.autoFetchAttempted = true
-      void this.runFetch({ cancelRefetch: false }).catch(() => undefined)
+      const handled = this.hub.runActiveInvalidation(
+        this.query,
+        (fetchOptions) => {
+          this.autoFetchAttempted = true
+          return this.runFetch(fetchOptions)
+        },
+      )
+      if (handled === undefined) this.scheduleInvalidationFetch()
     }
     return this.emitChanged()
+  }
+
+  private scheduleInvalidationFetch(): void {
+    if (this.invalidationFetchScheduled) return
+    const invalidatedQuery = this.query
+    this.invalidationFetchScheduled = true
+    // QueryClient 自身の active/all refetch を先に開始させ、同じ invalidate の二重 fetch を避ける。
+    queueMicrotask(() => {
+      this.invalidationFetchScheduled = false
+      if (
+        this.query !== invalidatedQuery ||
+        !this.hasCommit ||
+        this.committedIsRestoring ||
+        this.committedOptions.subscribed === false ||
+        !isEnabled(this.committedOptions, invalidatedQuery) ||
+        isSkipped(this.committedOptions) ||
+        resolveStaleTime(
+          this.committedOptions.staleTime,
+          invalidatedQuery,
+        ) === 'static' ||
+        invalidatedQuery.isActive() ||
+        invalidatedQuery.state.fetchStatus !== 'idle' ||
+        !invalidatedQuery.state.isInvalidated
+      ) return
+      this.autoFetchAttempted = true
+      void this.runFetch({ cancelRefetch: false }).catch(() => undefined)
+    })
   }
 
   addResultListener(listener: () => void): () => void {
     this.resultListeners.add(listener)
     return () => this.resultListeners.delete(listener)
+  }
+
+  isCommittedSubscribed(): boolean {
+    return !this.committedIsRestoring && this.committedOptions.subscribed !== false
   }
 
   subscribe(listener: () => void): () => void {
@@ -326,19 +485,23 @@ class LiteQueryEntry {
   private wasAutoFetchEligible = false
 
   private shouldAutoFetch(): boolean {
-    if (!this.hasCommit || this.isRestoring || this.options.subscribed === false) return false
-    if (!isEnabled(this.options, this.query) || isSkipped(this.options)) return false
-    if (this.query.state.status === 'error' && this.options.retryOnMount === false) return false
+    const options = this.committedOptions
+    if (!this.hasCommit || this.committedIsRestoring || options.subscribed === false) return false
+    if (!isEnabled(options, this.query) || isSkipped(options)) return false
+    if (this.query.state.status === 'error' && options.retryOnMount === false) return false
     if (this.query.state.data === undefined) return true
-    const policy = resolveRefetchPolicy(this.options.refetchOnMount, this.query)
+    const policy = resolveRefetchPolicy(options.refetchOnMount, this.query)
     if (policy === 'always') return true
     if (policy === false) return false
-    return isStale(this.options, this.query)
+    return isStale(options, this.query)
   }
 
-  private runFetch(fetchOptions?: LiteFetchOptions): Promise<unknown> {
-    this.applyOptions()
-    const pending = this.hub.fetch(this.query, this.options, fetchOptions)
+  private runFetch(
+    fetchOptions?: LiteFetchOptions,
+    options: AnyQueryOptions = this.committedOptions,
+  ): Promise<unknown> {
+    this.applyOptions(options)
+    const pending = this.hub.fetch(this.query, options, fetchOptions)
     this.currentPromise = pending
     void pending.then(
       () => {
@@ -361,49 +524,106 @@ class LiteQueryEntry {
     if (this.query.state.status === 'error' && this.query.state.fetchStatus === 'idle') {
       return undefined
     }
-    if (this.query.state.data !== undefined) {
-      if (this.query.promise) return undefined
-      if (!isStale(this.options, this.query)) return undefined
-      void this.runFetch({ cancelRefetch: false }).catch(() => undefined)
-      return undefined
-    }
+    if (this.query.state.data !== undefined) return undefined
     if (this.query.promise) return this.query.promise
-    return this.runFetch({ cancelRefetch: false })
+    return this.runFetch({ cancelRefetch: false }, this.options)
   }
 
-  afterCommit(): void {
-    this.applyOptions()
+  afterCommit(
+    options: AnyQueryOptions = this.committedOptions,
+    isRestoring = this.committedIsRestoring,
+  ): void {
+    if (this.committedOptions !== options || this.committedIsRestoring !== isRestoring) return
+    this.applyOptions(options)
     this.hasCommit = true
-    const eligible = !this.isRestoring && isEnabled(this.options, this.query) && !isSkipped(this.options)
+    const eligible =
+      !isRestoring &&
+      options.subscribed !== false &&
+      isEnabled(options, this.query) &&
+      !isSkipped(options)
     if (eligible && !this.wasAutoFetchEligible) {
       this.autoFetchAttempted = false
     }
     this.wasAutoFetchEligible = eligible
-    if (!this.autoFetchAttempted && this.shouldAutoFetch()) {
+    if (eligible && !this.autoFetchAttempted) {
       this.autoFetchAttempted = true
-      void this.runFetch({ cancelRefetch: false }).catch(() => undefined)
+      if (this.shouldAutoFetch()) {
+        void this.runFetch({ cancelRefetch: false }).catch(() => undefined)
+      }
     }
     this.configureTimers()
   }
 
-  commit(manageEnvironment = true): void {
-    this.applyOptions()
-    this.hasCommit = true
-    if (!this.isRestoring && this.options.subscribed !== false && !this.lease) {
-      this.lease = true
-      this.hub.retain(this.query, this.options.gcTime)
-    }
-    this.hub.noteGcTime(this.query, this.options.gcTime)
-    this.environmentRelease?.()
-    this.environmentRelease = undefined
-    if (!this.isRestoring && manageEnvironment && this.options.subscribed !== false) {
-      const environment: LiteEnvironmentListener = {
-        onFocus: () => this.triggerRefetch(this.options.refetchOnWindowFocus),
-        onOnline: () => this.triggerRefetch(this.options.refetchOnReconnect),
+  updateCommittedOptions(
+    options: AnyQueryOptions,
+    isRestoring: boolean,
+  ): void {
+    try {
+      this.committedOptions = options
+      this.committedIsRestoring = isRestoring
+      this.commitRenderResult()
+      this.applyOptions(options)
+      if (this.hasCommit) {
+        this.syncLease()
+        this.hub.noteGcTime(this.query, options.gcTime)
+        this.configureTimers()
       }
-      this.environmentRelease = this.hub.registerEnvironment(environment)
+    } catch (error) {
+      this.release()
+      throw error
     }
-    this.configureTimers()
+  }
+
+  commit(
+    options: AnyQueryOptions = this.options,
+    isRestoring = this.isRestoring,
+    manageEnvironment = true,
+  ): void {
+    try {
+      this.updateCommittedOptions(options, isRestoring)
+      this.hasCommit = true
+      this.syncLease()
+      this.hub.noteGcTime(this.query, options.gcTime)
+      this.environmentRelease?.()
+      this.environmentRelease = undefined
+      if (!isRestoring && manageEnvironment && options.subscribed !== false) {
+        const environment: LiteEnvironmentListener = {
+          onFocus: () => this.triggerRefetch(this.committedOptions.refetchOnWindowFocus),
+          onOnline: () => this.triggerRefetch(this.committedOptions.refetchOnReconnect),
+        }
+        this.environmentRelease = this.hub.registerEnvironment(environment)
+      }
+      this.configureTimers()
+    } catch (error) {
+      this.release()
+      throw error
+    }
+  }
+
+  private syncLease(): void {
+    const shouldRetain =
+      this.hasCommit &&
+      !this.committedIsRestoring &&
+      this.committedOptions.subscribed !== false
+    if (shouldRetain && !this.lease) {
+      try {
+        this.updateQuerySemantics()
+        this.hub.retain(this.query, this.committedOptions.gcTime)
+        this.lease = true
+      } catch (error) {
+        this.hub.clearQuerySemantics(this.querySemanticsKey)
+        throw error
+      }
+    } else if (shouldRetain) {
+      this.updateQuerySemantics()
+    } else if (!shouldRetain && this.lease) {
+      this.lease = false
+      try {
+        this.hub.clearQuerySemantics(this.querySemanticsKey)
+      } finally {
+        this.hub.release(this.query)
+      }
+    }
   }
 
   release(): void {
@@ -414,39 +634,44 @@ class LiteQueryEntry {
     this.hub.cancelInterval(this.intervalTimerKey)
     if (this.lease) {
       this.lease = false
-      this.hub.release(this.query)
+      try {
+        this.hub.clearQuerySemantics(this.querySemanticsKey)
+      } finally {
+        this.hub.release(this.query)
+      }
     }
   }
 
   configureTimers(): void {
-    if (!this.hasCommit || this.isRestoring || this.options.subscribed === false) {
+    const options = this.committedOptions
+    if (!this.hasCommit || this.committedIsRestoring || options.subscribed === false) {
       this.hub.cancelStale(this.staleTimerKey)
       this.hub.cancelInterval(this.intervalTimerKey)
       return
     }
-    const interval = resolveInterval(this.options.refetchInterval, this.query)
+    const interval = resolveInterval(options.refetchInterval, this.query)
     if (isValidTimeout(interval) && interval > 0) {
       this.hub.scheduleInterval(this.intervalTimerKey, {
         interval,
         callback: () => {
           if (
             !this.hasCommit ||
-            !isEnabled(this.options, this.query) ||
-            isSkipped(this.options) ||
-            (this.options.refetchIntervalInBackground !== true && !focusManager.isFocused())
+            !isEnabled(this.committedOptions, this.query) ||
+            isSkipped(this.committedOptions) ||
+            (this.committedOptions.refetchIntervalInBackground !== true && !focusManager.isFocused())
           ) return
           void this.runFetch({ cancelRefetch: false }).catch(() => undefined)
         },
-        inBackground: () => this.options.refetchIntervalInBackground === true || focusManager.isFocused(),
+        inBackground: () => this.committedOptions.refetchIntervalInBackground === true || focusManager.isFocused(),
       })
     } else {
       this.hub.cancelInterval(this.intervalTimerKey)
     }
 
-    const staleTime = resolveStaleTime(this.options.staleTime, this.query)
-    const configuredNotify = typeof this.options.notifyOnChangeProps === 'function'
-      ? this.options.notifyOnChangeProps()
-      : this.options.notifyOnChangeProps
+    const staleTime = resolveStaleTime(options.staleTime, this.query)
+    const configuredNotify = typeof options.notifyOnChangeProps === 'function'
+      ? options.notifyOnChangeProps()
+      : options.notifyOnChangeProps
     const tracksStale = configuredNotify === 'all' ||
       (Array.isArray(configuredNotify) && configuredNotify.includes('isStale')) ||
       this.trackedProps.has('isStale')
@@ -468,21 +693,30 @@ class LiteQueryEntry {
   }
 
   triggerRefetch(setting: unknown): void {
+    const options = this.committedOptions
     if (
       !this.hasCommit ||
-      this.isRestoring ||
-      this.options.subscribed === false ||
-      !isEnabled(this.options, this.query) ||
-      isSkipped(this.options)
+      this.committedIsRestoring ||
+      options.subscribed === false ||
+      !isEnabled(options, this.query) ||
+      isSkipped(options)
     ) return
     const policy = resolveRefetchPolicy(setting, this.query)
     if (policy === false) return
-    if (policy !== 'always' && !isStale(this.options, this.query)) return
+    if (policy !== 'always' && !isStale(options, this.query)) return
     void this.runFetch({ cancelRefetch: false }).catch(() => undefined)
   }
 
+  triggerEnvironment(setting: 'focus' | 'online'): void {
+    this.triggerRefetch(
+      setting === 'focus'
+        ? this.committedOptions.refetchOnWindowFocus
+        : this.committedOptions.refetchOnReconnect,
+    )
+  }
+
   refetch = async (refetchOptions?: RefetchOptions): Promise<AnyQueryResult> => {
-    if (isSkipped(this.options)) {
+    if (isSkipped(this.committedOptions)) {
       throw new Error(`Missing queryFn: '${this.hash}'`)
     }
     const fetchOptions: LiteFetchOptions = {
@@ -491,9 +725,11 @@ class LiteQueryEntry {
     try {
       await this.runFetch(fetchOptions)
     } catch (error) {
-      if (refetchOptions?.throwOnError || isSkipped(this.options)) throw error
+      if (refetchOptions?.throwOnError || isSkipped(this.committedOptions)) throw error
     }
-    return this.snapshot()
+    const next = this.computeCommittedResult()
+    this.syncRenderResultFromCommitted(next)
+    return next
   }
 }
 
@@ -501,18 +737,20 @@ function useEntry(
   options: AnyQueryOptions,
   client: QueryClient,
   isRestoring: boolean,
-): LiteQueryEntry {
+): readonly [LiteQueryEntry, () => void] {
   'use no memo'
   const hub = getLiteHub(client)
   const currentQuery = hub.buildQuery(options)
-  const previous = useRef<LiteQueryEntry | undefined>(undefined)
+  const committed = useRef<LiteQueryEntry | undefined>(undefined)
   const entry = useMemo(
-    () => new LiteQueryEntry(client, hub, options, previous.current, currentQuery),
+    () => new LiteQueryEntry(client, hub, options, committed.current, currentQuery),
     [client, currentQuery],
   )
   entry.update(options, isRestoring)
-  previous.current = entry
-  return entry
+  const markCommitted = useCallback(() => {
+    committed.current = entry
+  }, [entry])
+  return [entry, markCommitted]
 }
 
 /** 通常の query を native QueryCache へ直接つなぐ hook です。 */
@@ -539,7 +777,7 @@ export function useQueryLite(options: any, explicitClient?: QueryClient): AnyQue
   const client = useQueryClient(explicitClient)
   const isRestoring = useIsRestoring()
   const defaulted = client.defaultQueryOptions(options) as AnyQueryOptions
-  const entry = useEntry(defaulted, client, isRestoring)
+  const [entry, markEntryCommitted] = useEntry(defaulted, client, isRestoring)
   const subscribed = defaulted.subscribed !== false && !isRestoring
   const subscribe = useCallback(
     (listener: () => void) => entry.subscribe(listener),
@@ -549,14 +787,18 @@ export function useQueryLite(options: any, explicitClient?: QueryClient): AnyQue
   const result = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 
   useLayoutEffect(() => {
-    entry.commit()
+    entry.updateCommittedOptions(defaulted, isRestoring)
+  })
+  useLayoutEffect(() => {
+    entry.commit(defaulted, isRestoring)
+    markEntryCommitted()
     return () => entry.release()
-  }, [entry, subscribed])
+  }, [entry, subscribed, isRestoring, markEntryCommitted])
   useEffect(() => {
     if ((defaulted as { experimental_prefetchInRender?: boolean }).experimental_prefetchInRender) {
       warnUnsupportedOption('experimental_prefetchInRender')
     }
-    entry.afterCommit()
+    entry.afterCommit(defaulted, isRestoring)
   })
 
   const rawResult = entry.rawSnapshot()
@@ -576,6 +818,13 @@ interface LiteAggregateRuntime {
   }
   previousSnapshot: unknown
   previousItems: AnyQueryResult[]
+  committedEntries: LiteQueryEntry[]
+  committedHashIndexes: Map<string, number[]>
+  committedEntryIndexes: Map<LiteQueryEntry, number[]>
+  committedSnapshot: unknown
+  committedItems: AnyQueryResult[]
+  committedDirtyIndexes: Set<number>
+  committedCombine: ((results: readonly AnyQueryResult[]) => unknown) | undefined
   dirtyIndexes: Set<number>
   previousCombine: ((results: readonly AnyQueryResult[]) => unknown) | undefined
   releaseEntries: LiteQueryEntry[]
@@ -585,6 +834,7 @@ interface LiteAggregateRuntime {
   notifyListener: (() => void) | undefined
   processingCacheEvent: boolean
   subscribed: boolean
+  committedSubscribed: boolean
   committed: boolean
   subscribe(listener: () => void): () => void
   update(entries: LiteQueryEntry[], options: LiteAggregateRuntime['options']): void
@@ -595,6 +845,7 @@ interface LiteAggregateRuntime {
   onCacheEvent(hash: string, event: unknown): void
   notifyIfChanged(): void
   attachResultListeners(): void
+  syncCommitted(): void
 }
 
 function createAggregateRuntime(client: QueryClient, hub: LiteHub): LiteAggregateRuntime {
@@ -606,6 +857,13 @@ function createAggregateRuntime(client: QueryClient, hub: LiteHub): LiteAggregat
     options: {},
     previousSnapshot: undefined,
     previousItems: [],
+    committedEntries: [],
+    committedHashIndexes: new Map(),
+    committedEntryIndexes: new Map(),
+    committedSnapshot: undefined,
+    committedItems: [],
+    committedDirtyIndexes: new Set(),
+    committedCombine: undefined,
     dirtyIndexes: new Set<number>(),
     previousCombine: undefined,
     releaseEntries: [],
@@ -615,6 +873,7 @@ function createAggregateRuntime(client: QueryClient, hub: LiteHub): LiteAggregat
     notifyListener: undefined,
     processingCacheEvent: false,
     subscribed: true,
+    committedSubscribed: true,
     committed: false,
     subscribe(listener) {
       if (!runtime.subscribed) return () => undefined
@@ -628,9 +887,9 @@ function createAggregateRuntime(client: QueryClient, hub: LiteHub): LiteAggregat
         }
         runtime.notifyIfChanged()
       }
-      runtime.attachResultListeners()
+      runtime.syncCommitted()
       const releaseAggregate = runtime.hub.subscribeAggregate(
-        runtime.entries.map((entry) => entry.hash),
+        runtime.committedEntries.map((entry) => entry.hash),
         runtime.aggregateListener,
       )
       return () => {
@@ -669,12 +928,6 @@ function createAggregateRuntime(client: QueryClient, hub: LiteHub): LiteAggregat
         runtime.previousCombine = options.combine
         for (let index = 0; index < entries.length; index++) runtime.dirtyIndexes.add(index)
       }
-      if (runtime.committed) {
-        if (runtime.aggregateListener) {
-          runtime.hub.updateAggregate(entries.map((entry) => entry.hash), runtime.aggregateListener)
-        }
-        runtime.attachResultListeners()
-      }
     },
     snapshot() {
       if (runtime.previousSnapshot !== undefined && runtime.dirtyIndexes.size === 0) {
@@ -696,26 +949,47 @@ function createAggregateRuntime(client: QueryClient, hub: LiteHub): LiteAggregat
     },
     commit() {
       runtime.committed = true
+      runtime.committedSubscribed = runtime.subscribed
+      const previousReleaseEntries = runtime.releaseEntries
       const next = new Set(runtime.entries)
       for (const entry of runtime.releaseEntries) {
         if (!next.has(entry)) entry.release()
       }
-      if (!runtime.subscribed) {
+      if (!runtime.committedSubscribed) {
         for (const entry of runtime.releaseEntries) entry.release()
         runtime.releaseEntries = []
         runtime.environmentRelease?.()
         runtime.environmentRelease = undefined
-        runtime.attachResultListeners()
+        runtime.syncCommitted()
         return
       }
-      runtime.releaseEntries = [...runtime.entries]
-      for (const entry of runtime.entries) entry.commit(false)
-      runtime.attachResultListeners()
-      runtime.environmentRelease?.()
-      runtime.environmentRelease = runtime.hub.registerEnvironment({
-        onFocus: () => runtime.onEnvironment('focus'),
-        onOnline: () => runtime.onEnvironment('online'),
-      })
+      const nextReleaseEntries: LiteQueryEntry[] = []
+      try {
+        for (const entry of runtime.entries) {
+          nextReleaseEntries.push(entry)
+          entry.commit(entry.options, runtime.options.isRestoring === true, false)
+        }
+        runtime.syncCommitted()
+        runtime.environmentRelease?.()
+        runtime.environmentRelease = runtime.hub.registerEnvironment({
+          onFocus: () => runtime.onEnvironment('focus'),
+          onOnline: () => runtime.onEnvironment('online'),
+        })
+      } catch (error) {
+        runtime.environmentRelease?.()
+        runtime.environmentRelease = undefined
+        for (let index = nextReleaseEntries.length - 1; index >= 0; index--) {
+          nextReleaseEntries[index]!.release()
+        }
+        for (let index = previousReleaseEntries.length - 1; index >= 0; index--) {
+          previousReleaseEntries[index]!.release()
+        }
+        runtime.releaseEntries = []
+        runtime.committed = false
+        runtime.committedSubscribed = false
+        throw error
+      }
+      runtime.releaseEntries = nextReleaseEntries
     },
     release() {
       runtime.committed = false
@@ -727,34 +1001,42 @@ function createAggregateRuntime(client: QueryClient, hub: LiteHub): LiteAggregat
       runtime.releaseEntries = []
     },
     onEnvironment(setting) {
-      if (!runtime.subscribed) return
-      for (const entry of runtime.entries) {
-        entry.triggerRefetch(setting === 'focus' ? entry.options.refetchOnWindowFocus : entry.options.refetchOnReconnect)
-      }
+      if (!runtime.committedSubscribed) return
+      for (const entry of runtime.committedEntries) entry.triggerEnvironment(setting)
     },
     onCacheEvent(hash, event) {
-      const indexes = runtime.hashIndexes.get(hash)
+      const indexes = runtime.committedHashIndexes.get(hash)
       if (!indexes || indexes.length === 0) return
       for (const index of indexes) {
-        const entry = runtime.entries[index]!
-        if (entry.options.subscribed === false) continue
-        if (entry.onCacheEvent(event)) runtime.dirtyIndexes.add(index)
+        const entry = runtime.committedEntries[index]!
+        if (!entry.isCommittedSubscribed()) continue
+        if (entry.onCacheEvent(event)) {
+          runtime.committedItems[index] = entry.snapshot()
+          runtime.committedDirtyIndexes.add(index)
+          runtime.dirtyIndexes.add(index)
+        }
       }
     },
     notifyIfChanged() {
-      if (runtime.dirtyIndexes.size === 0 || !runtime.notifyListener) return
-      const previous = runtime.previousSnapshot
-      const next = runtime.snapshot()
+      if (runtime.committedDirtyIndexes.size === 0 || !runtime.notifyListener) return
+      const previous = runtime.committedSnapshot
+      const next = runtime.committedCombine
+        ? runtime.committedCombine(runtime.committedItems)
+        : runtime.committedItems.slice()
+      runtime.committedSnapshot = next
+      runtime.committedDirtyIndexes.clear()
       if (next !== previous) runtime.notifyListener()
     },
     attachResultListeners() {
       for (const release of runtime.resultReleases) release()
-      runtime.resultReleases = runtime.subscribed
-        ? [...new Set(runtime.entries)]
-          .filter((entry) => entry.options.subscribed !== false)
+      runtime.resultReleases = runtime.committedSubscribed
+        ? [...new Set(runtime.committedEntries)]
+          .filter((entry) => entry.isCommittedSubscribed())
           .map((entry) =>
             entry.addResultListener(() => {
-              for (const index of runtime.hashIndexes.get(entry.hash) ?? []) {
+              for (const index of runtime.committedEntryIndexes.get(entry) ?? []) {
+                runtime.committedItems[index] = entry.snapshot()
+                runtime.committedDirtyIndexes.add(index)
                 runtime.dirtyIndexes.add(index)
               }
               if (!runtime.processingCacheEvent) runtime.notifyIfChanged()
@@ -762,8 +1044,50 @@ function createAggregateRuntime(client: QueryClient, hub: LiteHub): LiteAggregat
           )
         : []
     },
+    syncCommitted() {
+      runtime.committedSubscribed = runtime.subscribed
+      runtime.committedEntries = runtime.entries
+      runtime.committedHashIndexes = new Map()
+      runtime.committedEntryIndexes = new Map()
+      runtime.committedEntries.forEach((entry, index) => {
+        const indexes = runtime.committedHashIndexes.get(entry.hash)
+        if (indexes) indexes.push(index)
+        else runtime.committedHashIndexes.set(entry.hash, [index])
+        const entryIndexes = runtime.committedEntryIndexes.get(entry)
+        if (entryIndexes) entryIndexes.push(index)
+        else runtime.committedEntryIndexes.set(entry, [index])
+      })
+      runtime.committedItems = runtime.previousItems.slice()
+      runtime.committedSnapshot = runtime.previousSnapshot
+      runtime.committedCombine = runtime.options.combine
+      runtime.committedDirtyIndexes.clear()
+      if (runtime.aggregateListener) {
+        runtime.hub.updateAggregate(
+          runtime.committedEntries.map((entry) => entry.hash),
+          runtime.aggregateListener,
+        )
+      }
+      runtime.attachResultListeners()
+    },
   }
   return runtime
+}
+
+// options 配列だけが作り直された render では lease と polling lifecycle を維持する。
+function useEntryLifecycleIdentity(
+  entries: LiteQueryEntry[],
+): readonly [LiteQueryEntry[], () => void] {
+  'use no memo'
+  const committed = useRef(entries)
+  const identity =
+    committed.current.length === entries.length &&
+    committed.current.every((entry, index) => entry === entries[index])
+      ? committed.current
+      : entries
+  const markCommitted = useCallback(() => {
+    committed.current = identity
+  }, [identity])
+  return [identity, markCommitted]
 }
 
 /** 複数 query を一つの aggregate subscription で購読する hook です。 */
@@ -793,11 +1117,10 @@ export function useQueriesLite(
     client: QueryClient
     entries: LiteQueryEntry[]
   } | undefined>(undefined)
-  if (!previousEntriesState.current || previousEntriesState.current.client !== client) {
-    previousEntriesState.current = { client, entries: [] }
-  }
   const entries = useMemo(() => {
-    const previousEntries = previousEntriesState.current!.entries
+    const previousEntries = previousEntriesState.current?.client === client
+      ? previousEntriesState.current.entries
+      : []
     const previousByHash = new Map<string, LiteQueryEntry[]>()
     for (let index = previousEntries.length - 1; index >= 0; index -= 1) {
       const entry = previousEntries[index]!
@@ -816,8 +1139,11 @@ export function useQueriesLite(
       return entry
     })
   }, [client, defaultedQueries, hub, isRestoring])
-  previousEntriesState.current.entries = entries
-  const runtime = useMemo(() => createAggregateRuntime(client, hub), [client, hub])
+  const [lifecycleEntries, markLifecycleCommitted] = useEntryLifecycleIdentity(entries)
+  const runtime = useMemo(
+    () => createAggregateRuntime(client, hub),
+    [client, hub, lifecycleEntries],
+  )
   runtime.update(entries, { ...options, isRestoring })
   const subscribe = useCallback(
     (listener: () => void) => runtime.subscribe(listener),
@@ -827,16 +1153,31 @@ export function useQueriesLite(
   const result = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 
   useLayoutEffect(() => {
+    entries.forEach((entry, index) => {
+      entry.updateCommittedOptions(defaultedQueries[index]!, isRestoring)
+    })
+    runtime.syncCommitted()
+  }, [
+    runtime,
+    entries,
+    defaultedQueries,
+    isRestoring,
+    options.combine,
+    options.subscribed,
+  ])
+  useLayoutEffect(() => {
     runtime.commit()
+    markLifecycleCommitted()
+    previousEntriesState.current = { client, entries: lifecycleEntries }
     return () => runtime.release()
-  }, [runtime, entries, options.subscribed, isRestoring])
+  }, [runtime, lifecycleEntries, options.subscribed, isRestoring, client, markLifecycleCommitted])
   useEffect(() => {
-    for (const entry of entries) {
+    entries.forEach((entry, index) => {
       if ((entry.options as { experimental_prefetchInRender?: boolean }).experimental_prefetchInRender) {
         warnUnsupportedOption('experimental_prefetchInRender')
       }
-      entry.afterCommit()
-    }
+      entry.afterCommit(defaultedQueries[index]!, isRestoring)
+    })
   })
 
   return result
@@ -855,7 +1196,7 @@ export function useSuspenseQueryLite<
   const defaulted = defaultSuspenseOptions(
     client.defaultQueryOptions(options as AnyQueryOptions) as AnyQueryOptions,
   )
-  const entry = useEntry(defaulted, client, isRestoring)
+  const [entry, markEntryCommitted] = useEntry(defaulted, client, isRestoring)
   const subscribed = defaulted.subscribed !== false && !isRestoring
   const subscribe = useCallback(
     (listener: () => void) => entry.subscribe(listener),
@@ -866,14 +1207,18 @@ export function useSuspenseQueryLite<
   const pending = entry.startFetchInRender()
 
   useLayoutEffect(() => {
-    entry.commit()
+    entry.updateCommittedOptions(defaulted, isRestoring)
+  })
+  useLayoutEffect(() => {
+    entry.commit(defaulted, isRestoring)
+    markEntryCommitted()
     return () => entry.release()
-  }, [entry, subscribed])
+  }, [entry, subscribed, isRestoring, markEntryCommitted])
   useEffect(() => {
     if ((defaulted as { experimental_prefetchInRender?: boolean }).experimental_prefetchInRender) {
       warnUnsupportedOption('experimental_prefetchInRender')
     }
-    entry.afterCommit()
+    entry.afterCommit(defaulted, isRestoring)
   })
 
   if (
@@ -912,11 +1257,10 @@ export function useSuspenseQueriesLite(
     client: QueryClient
     entries: LiteQueryEntry[]
   } | undefined>(undefined)
-  if (!previousEntriesState.current || previousEntriesState.current.client !== client) {
-    previousEntriesState.current = { client, entries: [] }
-  }
   const entries = useMemo(() => {
-    const previousEntries = previousEntriesState.current!.entries
+    const previousEntries = previousEntriesState.current?.client === client
+      ? previousEntriesState.current.entries
+      : []
     const previousByHash = new Map<string, LiteQueryEntry[]>()
     for (let index = previousEntries.length - 1; index >= 0; index -= 1) {
       const entry = previousEntries[index]!
@@ -935,8 +1279,11 @@ export function useSuspenseQueriesLite(
       return entry
     })
   }, [client, defaultedQueries, hub, isRestoring])
-  previousEntriesState.current.entries = entries
-  const runtime = useMemo(() => createAggregateRuntime(client, hub), [client, hub])
+  const [lifecycleEntries, markLifecycleCommitted] = useEntryLifecycleIdentity(entries)
+  const runtime = useMemo(
+    () => createAggregateRuntime(client, hub),
+    [client, hub, lifecycleEntries],
+  )
   runtime.update(entries, { ...options, isRestoring })
   const aggregateSubscribed = options.subscribed !== false && !isRestoring
   const subscribe = useCallback(
@@ -950,16 +1297,31 @@ export function useSuspenseQueriesLite(
     .filter((promise): promise is Promise<unknown> => promise !== undefined)
 
   useLayoutEffect(() => {
+    entries.forEach((entry, index) => {
+      entry.updateCommittedOptions(defaultedQueries[index]!, isRestoring)
+    })
+    runtime.syncCommitted()
+  }, [
+    runtime,
+    entries,
+    defaultedQueries,
+    isRestoring,
+    options.combine,
+    options.subscribed,
+  ])
+  useLayoutEffect(() => {
     runtime.commit()
+    markLifecycleCommitted()
+    previousEntriesState.current = { client, entries: lifecycleEntries }
     return () => runtime.release()
-  }, [runtime, entries, aggregateSubscribed])
+  }, [runtime, lifecycleEntries, aggregateSubscribed, client, markLifecycleCommitted])
   useEffect(() => {
-    for (const entry of entries) {
+    entries.forEach((entry, index) => {
       if ((entry.options as { experimental_prefetchInRender?: boolean }).experimental_prefetchInRender) {
         warnUnsupportedOption('experimental_prefetchInRender')
       }
-      entry.afterCommit()
-    }
+      entry.afterCommit(defaultedQueries[index]!, isRestoring)
+    })
   })
 
   if (

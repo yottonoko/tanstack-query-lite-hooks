@@ -73,6 +73,12 @@ unit/type tests は次の挙動を固定します。
 - `combine`、`notifyOnChangeProps`、`subscribed`、`throwOnError`、`networkMode`
 - unsupported option/result の development warning
 - `QueryObserver`、mutation、独自 provider/client を誤って要求しないこと
+- inline `queryFn` / options / query list を高速で更新しても余分な fetch や polling starvation を起こさないこと
+- fresh-to-stale の parent rerender を新しい mount と誤認しないこと
+- abandoned transition の callback/key/select result/top-level `subscribed` が commit 済み subscription や focus/reconnect 判定へ漏れないこと
+- native/Lite 同時 invalidate の request deduplication、`refetchType`、`static`、await、cancel/restart、async/stacked decorator の再入
+- aggregate item の `subscribed` 切り替えで lease と request が増殖しないこと
+- 同じ QueryCache を使う複数 QueryClient 間の Lite GC lease
 
 test を追加する時は、必要な native QueryClient を test scope で作り、provider を設置してください。Lite hook だけで cache を初期化する test は実運用の Context 境界を検証しません。
 

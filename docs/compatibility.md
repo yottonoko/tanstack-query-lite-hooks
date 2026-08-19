@@ -37,6 +37,12 @@ function NativeAndLite() {
 
 同じ key の native と Lite query function は一つの native query state と in-flight request を共有します。query function の副作用、retry、error object、abort の結果も native state machine が決めます。
 
+native と Lite の両方が同じ query を購読している状態で `invalidateQueries` を呼んだ場合、commit 済みで有効な Lite subscription を共有 Query record の active 判定へ含めます。どの QueryClient から呼んでも native refetch pass が同じ in-flight request、cancel、paused、error、Promise 処理を利用します。`refetchType: 'inactive'` は有効な Lite query を除外し、`'all'` は含め、`'none'` は invalidate のみにします。commit 済み Lite subscription の `staleTime: 'static'` も Query record へ反映し、`refetchQueries` と `invalidateQueries` のいずれでも invalidate のみにします。最後の該当 lease を解除した時は native method を正確に復元します。
+
+最初の Lite subscription を commit した時、package はその Query record の `isActive` / `isDisabled` / `isStatic` を lease 期間だけ拡張し、Lite hook が使う `QueryClient` instance の `invalidateQueries` には別実装向けの Promise 追跡 accessor を設置します。通常の代入で decorator や別実装を登録しても accessor は維持され、decorator が取得済みの旧 method へ正規化済み filters を渡す場合も再帰しません。複数の decorator は登録順の chain を保ち、async decorator と並行呼び出しも前段を飛ばしません。async の別実装が `await` 後に `QueryClient.prototype.invalidateQueries` を呼ぶ場合も、返された Promise は対象 Lite refetch を待ちます。`Object.defineProperty` で accessor 自体を置き換えるコードまでは仲介できません。server render や破棄された未 commit render だけでは QueryClient/Query を変更しません。
+
+この commit-time 拡張には通常の TanStack Query が生成する extensible な `Query` / `QueryClient` が必要です。`Object.freeze`、`Object.seal`、`Object.preventExtensions`、または non-configurable な同名 own method descriptor を外部から適用した object はサポートしません。拡張できない場合は subscription retention より前に例外を投げ、method、GC lease、`gcTime` を残しません。
+
 ## Native observer との相違
 
 Lite は `QueryObserver`、`InfiniteQueryObserver`、またはその subclass を生成しません。hook は QueryCache の state/event を直接購読し、`useQueriesLite` は複数 key の変更を aggregate して React へ通知します。
@@ -44,11 +50,12 @@ Lite は `QueryObserver`、`InfiniteQueryObserver`、またはその subclass �
 この設計には次の意味があります。
 
 - Lite subscription は `query.getObserversCount()` の native observer 数へ加算されません
-- Devtools の active query 表示、observer list、observer count は native observer のみを表示します
-- native の active-only refetch、focus/reconnect 判定、type-level active semantics は Lite component の存在だけでは変わりません
+- `query.isActive()` と active/inactive query filter は commit 済みで有効な Lite subscription を含みます
+- observer list と observer count は native observer のみを表示します。Devtools が `isActive()` を使う表示は Lite lease を含む場合があります
+- native observer の focus/reconnect dispatch は Lite を対象にせず、LiteHub が同じ trigger を別に処理します
 - native `QueryObserver` を受け取る third-party plugin や observer callback は Lite hook を検出しません
 
-「画面に Lite hook があるから native query は active」と仮定するコードは避けてください。active query を基準にした運用や Devtools の観測が必要な画面では、該当部分に native `useQuery` / `useInfiniteQuery` を利用します。
+observer count や observer instance を基準にした plugin 互換性が必要な画面では、該当部分に native `useQuery` / `useInfiniteQuery` を利用します。
 
 ## GC と lifecycle
 
@@ -60,8 +67,15 @@ native observer が一つもない Lite-only screen では、次の差が生じ�
 2. LiteHub は Lite subscription の lease がある限り query を保持し、最後の Lite subscription が外れた後は Lite の `gcTime` ルールで回収します。
 3. native observer の `gcTime` と LiteHub の `gcTime` は同一の lifecycle ではないため、Devtools の observer count と retained query 数は一致しない場合があります。
 4. native observer が残っている場合も、Lite の unmount はその native observer、request、native GC lease を解除しません。
+5. 複数 QueryClient が一つの QueryCache を共有する場合、Lite lease は QueryClient ごとではなく QueryCache と Query object の組み合わせで集約します。
 
 Lite-only query の再取得や保持期限を明示的に制御する場合は native `staleTime`、Lite query の `gcTime`、`invalidateQueries`、`cancelQueries` を設定してください。Devtools の count と実際の Lite component 数が一致しないことは仕様です。
+
+## Render と callback identity
+
+Lite は render 中に受け取った options/result memory と、最後に commit された options/result memory を分離します。inline `queryFn`、`select`、`enabled` function、interval resolver、query list が新しい identity になっても、それだけでは mount/refetch とみなしません。cache event、timer、manual refetch は commit 済み callback と result baseline を使い、Suspense や transition で破棄された render の callback/key/selected result を live subscription へ反映しません。
+
+`useQueriesLite` の `queries` は immutable value として扱います。同内容の新しい配列を毎 render 渡すことは正しく動作しますが、大量 query では default options の再計算を避けるため stable array identity を推奨します。同じ配列をその場で mutate する使い方は検出できないため非対応です。
 
 ## Supported query surface
 

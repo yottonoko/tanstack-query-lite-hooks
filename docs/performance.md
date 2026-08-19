@@ -92,29 +92,33 @@ large scenario の `singleUpdate` は key 0 だけを `setQueryData` し、変�
 
 大量 query では `queries` 配列を immutable value として扱い、内容を変更する時は新しい配列を渡してください。同じ配列 identity の再 render では、Lite は default options と native Query lookup を再利用し、一件の cache event に対して全 options を処理し直しません。配列をその場で mutate する使い方はサポートしません。
 
-## 2026-08-19 の実測結果
+同内容の新しい配列を毎 render 作る場合も、subscription lease、polling deadline、mount refetch 判定は維持されます。ただし options の走査と default 化は必要です。高頻度の parent render と 10,000 件以上の query を組み合わせる場合、正しさとは別の性能要件として stable array identity を利用してください。
+
+## 2026-08-20 の実測結果
 
 最終 MJS build を Headless Chrome 151、React 19.2.8、`@tanstack/react-query` 5.101.4、SWR 2.5.1 で測定しました。1,000-hook scenario は 10 warmups + 30 measured runs、large scenario は 2 warmups + 5 measured runs の median です。実行時の PC 負荷で数値は変動するため、絶対値ではなく同一 run 内の比較として扱います。
 
 | scenario | Lite | native | SWR |
 | --- | ---: | ---: | ---: |
-| 1k shared mount | 5.00 ms | 5.75 ms | 8.60 ms |
-| 1k shared resolve | 9.10 ms | 10.90 ms | 13.30 ms |
-| 1k shared single update | 7.45 ms | 9.65 ms | 12.10 ms |
-| 1k shared all update | 7.50 ms | 10.40 ms | 12.30 ms |
-| 1k distinct mount | 5.90 ms | 6.60 ms | 10.80 ms |
-| 1k distinct resolve | 17.70 ms | 248.35 ms | 19.85 ms |
-| 1k distinct single update | 0.30 ms | 3.35 ms | 0.30 ms |
-| 1k distinct all update | 9.55 ms | 12.15 ms | 15.55 ms |
+| 1k shared mount | 5.20 ms | 4.80 ms | 7.05 ms |
+| 1k shared resolve | 9.35 ms | 9.20 ms | 10.50 ms |
+| 1k shared single update | 7.30 ms | 8.70 ms | 10.40 ms |
+| 1k shared all update | 7.40 ms | 6.25 ms | 10.20 ms |
+| 1k distinct mount | 6.70 ms | 5.70 ms | 9.00 ms |
+| 1k distinct resolve | 15.85 ms | 197.90 ms | 15.45 ms |
+| 1k distinct single update | 0.20 ms | 2.80 ms | 0.20 ms |
+| 1k distinct all update | 9.35 ms | 10.40 ms | 13.00 ms |
 
 | large scenario | Lite | native | Lite 20k/10k |
 | --- | ---: | ---: | ---: |
-| 10k mount | 44.2 ms | 82.2 ms | - |
-| 20k mount | 83.0 ms | 150.5 ms | 1.878x |
-| 10k single update | 4.7 ms | 25.5 ms | - |
-| 20k single update | 9.3 ms | 50.2 ms | 1.979x |
+| 10k mount | 55.9 ms | 64.2 ms | - |
+| 20k mount | 122.1 ms | 123.7 ms | 2.184x |
+| 10k single update | 4.2 ms | 21.8 ms | - |
+| 20k single update | 8.2 ms | 44.3 ms | 1.952x |
 
-core、fetch deduplication、large mount、large single-update、3x scaling の acceptance は全て通過しました。未最適化時は 20k single update が Lite 47.1 ms / native 43.7 ms となったため、stable `queries` 配列の再 default 化を除去し、12,000 件の回帰テストを追加しました。最終 build の隣接 run でも PC 負荷により 10k 4.5 ms / 20k 14.4 ms（3.2x）となる揺れが一度ありましたが、どちらの run でも 20k Lite は native より大幅に短く、上表の最終 run では 3x scaling gate も通過しています。
+core、fetch deduplication、large mount、large single-update、3x scaling の acceptance は全て通過しました。commit 済み options/result/entry memory の分離、failure-atomic lease setup、cache-wide active/static/disabled semantics、shared-key O(1) static method setup、default options の二重計算除去、invalidate filter/await/cancel/deduplication、duplicate entry notification、polling lifecycle 修正を含む build での値です。acceptance 外の parent-only rerender median は shared で Lite 7.70 ms / native 3.95 ms / SWR 10.45 ms、distinct で Lite 8.10 ms / native 3.40 ms / SWR 11.15 ms でした。parent rerender は native が短い一方、Lite は同じ run の SWR より短く、inline options の stress tests でも余分な fetch と timer reset がないことを別に検証しています。
+
+この run の 20k mount 差は 1.6 ms で、PC 負荷による変動より十分に大きいとは断定できません。runner の pass は記録しますが、mount の継続的な優位を判断する場合は idle machine で複数 run を追加してください。一方、20k single update は同一 run で 8.2 ms / 44.3 ms と大きな差がありました。
 
 ## Retained-memory benchmark
 
@@ -136,7 +140,7 @@ library/count の組み合わせごとに fresh Chromium context を作り、前
 
 runner は CDP `Runtime.getHeapUsage` と `Memory.getDOMCounters` を出力します。mounted delta は保持コストの診断、teardown delta は回収漏れの診断に使います。mounted heap が小さいことを速度優位の条件に含めません。
 
-2026-08-19 の同じ最終 build では、10,000 件の retained `usedSize` は Lite 16,331,676 bytes / native 16,307,584 bytes、20,000 件は Lite 32,304,544 bytes / native 32,271,404 bytes でした。teardown 後の baseline 差は 20,000 件で Lite 341,804 bytes / native 348,408 bytes、DOM node 差はどちらも 0、event listener 差はどちらも 1 です。この結果は native QueryCache 自体が保持量の中心で、Lite の速度差が大幅な heap 削減によるものではないことを示す診断値です。単一 run の leak 証明や一般的な memory 上限としては扱いません。
+2026-08-19 時点の build では、10,000 件の retained `usedSize` は Lite 16,331,676 bytes / native 16,307,584 bytes、20,000 件は Lite 32,304,544 bytes / native 32,271,404 bytes でした。teardown 後の baseline 差は 20,000 件で Lite 341,804 bytes / native 348,408 bytes、DOM node 差はどちらも 0、event listener 差はどちらも 1 です。この値は現在の最終 build を再測定したものではありません。当時の結果は native QueryCache 自体が保持量の中心であることを示す診断値ですが、現在の build の leak 証明、一般的な memory 上限、速度 acceptance としては扱いません。
 
 ## 実行条件
 

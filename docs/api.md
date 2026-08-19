@@ -80,11 +80,15 @@ const result = useQueryLite({
 })
 ```
 
+options object と `queryFn` は render ごとに新しい identity でも利用できます。identity の変更だけでは query を再取得せず、最後に commit された options を timer、invalidate、focus/reconnect、manual refetch が参照します。query key、`enabled`、`skipToken`、明示 refetch など fetch 条件そのものが変化した場合は、その条件に従います。
+
 返却 result の data、error、status、fetch status、stale 判定、`refetch` は native query state を元にします。Lite は native `QueryObserver` instance を返しません。observer instance、observer count、observer 専用 option を使うコードには [compatibility](compatibility.md) の制限が適用されます。
 
 ## `useQueriesLite`
 
 `queries` は readonly/immutable な入力として扱います。query options の内容や順序を変更する場合は新しい配列を渡してください。同じ配列 object をその場で mutate する使い方はサポートしません。同じ配列 identity のまま cache data だけが更新された場合、Lite は default options と Query lookup を再利用して大量 query の一件更新を軽量に保ちます。
+
+JSX 内で同内容の新しい配列を毎 render 作る使い方も機能上は対応し、polling lease や mount 判定を作り直しません。ただし各 options の default 化は必要になるため、数千件以上を高頻度で parent rerender する画面では配列 identity を memoize してください。stable identity は正しさの条件ではなく、大量 query の性能最適化です。
 
 ```ts
 useQueriesLite({ queries }, explicitClient?): readonly UseQueryResult[]

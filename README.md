@@ -152,7 +152,11 @@ queryClient.setQueryData(['todos'], (previous: Todo[] | undefined) => [
 
 native hook が取得した data を Lite hook が読めます。逆方向も同じです。in-flight request の deduplication、`AbortSignal`、retry、invalidate、`setQueryData`、`dataUpdatedAt` は native QueryClient の state machine に従います。
 
-ただし Lite の購読は TanStack Query の `QueryObserver` として登録されません。そのため native の observer 数、Devtools の active 表示、active query 判定は native observer だけを対象にします。LiteHub は Lite subscription の lease と GC を独自に管理するため、native observer の数と Lite query の保持状態は一致しません。詳細な互換性と GC の差は [compatibility](docs/compatibility.md) を参照してください。
+`queryFn: () => value` のような inline callback や options object が parent render ごとに新しくなっても、それだけを理由に automatic fetch を再実行しません。新しい callback は commit 後の次回 refetch から利用し、破棄された concurrent render の callback は現在表示中の subscription へ公開しません。fresh data が後から stale になった場合も、無関係な parent render を `refetchOnMount` として扱いません。
+
+複数の native `QueryClient` が同じ `QueryCache` object を明示的に共有する構成では、Lite の GC lease も cache/query 単位で共有します。一方の Lite component が unmount しても、別 client 配下の Lite component が同じ query を購読している間は query record を削除しません。
+
+ただし Lite の購読は TanStack Query の `QueryObserver` として登録されないため、native の observer 数と observer list には含まれません。commit 済みで有効な Lite lease は共有 Query record の `isActive()` と active/inactive filter へ含まれ、Devtools が `isActive()` を使う表示にも反映される場合があります。LiteHub は Lite subscription の lease と GC を独自に管理するため、native observer の数と Lite query の保持状態は一致しません。詳細な互換性と GC の差は [compatibility](docs/compatibility.md) を参照してください。
 
 ## `queryOptions`、`infiniteQueryOptions`、`skipToken`
 
@@ -219,6 +223,8 @@ export function ProfileBoundary() {
 ```
 
 Suspense tree が commit される前に始まった request の扱いは native QueryClient の lifecycle に従います。fallback の unmount だけで request が必ず cancel されるとは限りません。
+
+data が既にある Suspense query は、stale になった後の parent render だけでは再取得しません。初回 mount、明示 invalidate/refetch、focus/reconnect など、対応する lifecycle trigger で background fetch を開始します。
 
 ## SSR と hydration
 
@@ -304,8 +310,9 @@ Lite が意味を保てない native option や result field を受け取った�
 - `QueryObserver`、`InfiniteQueryObserver` などの observer class は提供しません
 - mutation hook は提供しません。mutation は native `useMutation` を利用してください
 - Lite 独自の `QueryClient`、`QueryClientProvider`、Context は提供しません
-- Lite の subscription は TanStack Query の active observer として数えられません
-- Devtools の active 表示、observer count、active-only の type semantics は native observer のみを対象にします
+- Lite の subscription は TanStack Query の observer count へ加算されません
+- commit 済みで有効な Lite subscription は共有 Query record の `isActive()` と active/inactive filter へ反映されますが、observer list は増えません
+- native observer の focus/reconnect dispatch や observer callback は Lite subscription を対象にしません
 - native QueryCache の observer-based GC と LiteHub の subscription-based GC は同一ではありません
 
 既存 application の query の一部だけを Lite へ移し、mutation、Devtools、observer API、SSR は native API のまま維持できます。

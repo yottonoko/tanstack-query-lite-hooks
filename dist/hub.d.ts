@@ -20,6 +20,11 @@ export interface LiteIntervalEntry {
     callback: () => void;
     inBackground?: () => boolean;
 }
+interface LiteQuerySemantics {
+    readonly isActive: () => boolean;
+    readonly isStatic: () => boolean;
+    readonly mayBeStatic?: boolean;
+}
 /**
  * QueryClient 単位のキャッシュ購読とタイマーをまとめる内部ハブ。
  * Lite 購読者は Query の observers 配列へ登録せず、このハブだけを購読する。
@@ -44,6 +49,8 @@ export declare class LiteHub {
     private intervalTimer;
     private intervalTimerDeadline;
     constructor(client: QueryClient);
+    /** QueryClient の active invalidate に Lite-only refetch を合流する。 */
+    runActiveInvalidation(query: AnyLiteQuery, fetch: (options: LiteFetchOptions) => Promise<unknown>): boolean | undefined;
     /** キャッシュへの実購読は Hub ごとに最大一つだけ作る */
     private ensureExternalSubscriptions;
     private maybeReleaseExternalSubscriptions;
@@ -60,6 +67,10 @@ export declare class LiteHub {
     fetch<TData = unknown>(query: AnyLiteQuery, options?: QueryOptions<any, any, any, any>, fetchOptions?: LiteFetchOptions<TData>): Promise<TData>;
     retain(query: AnyLiteQuery, gcTime?: number): void;
     noteGcTime(query: AnyLiteQuery, gcTime: number | undefined): void;
+    /** commit 済み Lite subscription の active/static 判定を共有する。 */
+    setQuerySemantics(query: AnyLiteQuery, lease: object, semantics: LiteQuerySemantics): void;
+    /** この subscription が保持していた active/static 判定を解除する。 */
+    clearQuerySemantics(lease: object): void;
     release(query: AnyLiteQuery): void;
     private scheduleReleasedQuery;
     private flushGcCandidate;
@@ -73,3 +84,4 @@ export declare class LiteHub {
     destroy(): void;
 }
 export declare function getLiteHub(client: QueryClient): LiteHub;
+export {};

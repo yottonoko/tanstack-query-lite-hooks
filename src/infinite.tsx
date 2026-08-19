@@ -27,6 +27,7 @@ import type {
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useSyncExternalStore,
@@ -78,7 +79,10 @@ interface InfiniteRuntime<TData extends AnyInfiniteResult = AnyInfiniteResult> {
   hub: LiteHub;
   query: AnyLiteQuery;
   options: AnyInfiniteOptions;
+  // Cache event と timer は最後に commit された options だけを参照する。
+  committedOptions: AnyInfiniteOptions;
   memory: InfiniteResultMemory;
+  committedMemory: InfiniteResultMemory;
   result: TData;
   refresh?: () => AnyInfiniteResult;
   listener: (() => void) | undefined;
@@ -86,6 +90,10 @@ interface InfiniteRuntime<TData extends AnyInfiniteResult = AnyInfiniteResult> {
   autoFetchAttempted: boolean;
   wasAutoFetchEligible: boolean;
   isRestoring: boolean;
+  committedIsRestoring: boolean;
+  invalidationFetchScheduled: boolean;
+  querySemanticsKey: object;
+  retainedQuery: AnyLiteQuery | undefined;
 }
 
 function resolveEnabled(
@@ -228,6 +236,33 @@ function resetMemoryForQuery(
   memory.promiseData = undefined;
 }
 
+function cloneInfiniteMemory(
+  memory: InfiniteResultMemory,
+): InfiniteResultMemory {
+  const clone: InfiniteResultMemory = {
+    selectState: { ...memory.selectState },
+    // property access は commit 後にも起こるため、追加方向だけの tracking set は共有する。
+    // select と result の比較基準だけを分離し、破棄 render による通知抑制を防ぐ。
+    trackedProps: memory.trackedProps,
+  };
+  if (memory.query !== undefined) clone.query = memory.query;
+  if (memory.queryInitialState !== undefined) {
+    clone.queryInitialState = memory.queryInitialState;
+  }
+  if (memory.previousResult !== undefined) {
+    clone.previousResult = memory.previousResult;
+  }
+  if (memory.previousResultState !== undefined) {
+    clone.previousResultState = memory.previousResultState;
+  }
+  if (memory.previousResultOptions !== undefined) {
+    clone.previousResultOptions = memory.previousResultOptions;
+  }
+  if (memory.promise !== undefined) clone.promise = memory.promise;
+  if (memory.promiseData !== undefined) clone.promiseData = memory.promiseData;
+  return clone;
+}
+
 function updateResult(
   runtime: InfiniteRuntime,
   refetch: (options?: RefetchOptions) => Promise<AnyInfiniteResult>,
@@ -237,8 +272,11 @@ function updateResult(
   fetchPreviousPage: (
     options?: FetchPreviousPageOptions,
   ) => Promise<AnyInfiniteResult>,
+  options: AnyInfiniteOptions = runtime.options,
+  isRestoring = runtime.isRestoring,
+  memory: InfiniteResultMemory = runtime.memory,
 ): AnyInfiniteResult {
-  const { query, options, memory } = runtime;
+  const { query } = runtime;
   resetMemoryForQuery(memory, query);
 
   if (memory.selectState.selectFn !== options.select) {
@@ -251,7 +289,7 @@ function updateResult(
 
   const useOptimisticFetchState =
     !runtime.autoFetchAttempted &&
-    !runtime.isRestoring &&
+    !isRestoring &&
     options.subscribed !== false &&
     query.state.status === "pending" &&
     query.state.fetchStatus === "idle" &&
@@ -288,7 +326,8 @@ function runFetch(
   fetchOptions: RefetchOptions | FetchNextPageOptions | FetchPreviousPageOptions,
   direction?: "forward" | "backward",
 ): Promise<AnyInfiniteResult> {
-  const { hub, query, options } = runtime;
+  const { hub, query } = runtime;
+  const options = runtime.committedOptions;
   const queryFetchOptions = direction
     ? {
         ...fetchOptions,
@@ -341,12 +380,18 @@ function useInfiniteRuntime(
       hub,
       query,
       options: defaultedOptions,
+      committedOptions: defaultedOptions,
       memory,
+      committedMemory: cloneInfiniteMemory(memory),
       result: undefined as never,
       listener: undefined,
       autoFetchAttempted: false,
       wasAutoFetchEligible: false,
       isRestoring,
+      committedIsRestoring: isRestoring,
+      invalidationFetchScheduled: false,
+      querySemanticsKey: {},
+      retainedQuery: undefined,
     }),
     [client, hub, memory, query],
   );
@@ -363,18 +408,29 @@ function useInfiniteRuntime(
     }),
     [runtime],
   );
-  const makeResult = useCallback(() => {
+  const makeResult = useCallback((
+    resultOptions: AnyInfiniteOptions = runtime.options,
+    resultIsRestoring = runtime.isRestoring,
+    resultMemory: InfiniteResultMemory = runtime.memory,
+  ) => {
     const next = updateResult(
       runtime,
       actions.refetch,
       actions.fetchNextPage,
       actions.fetchPreviousPage,
+      resultOptions,
+      resultIsRestoring,
+      resultMemory,
     );
     runtime.result = next;
     runtime.snapshot = next;
     return next;
   }, [actions, runtime]);
-  runtime.refresh = makeResult;
+  runtime.refresh = () => makeResult(
+    runtime.committedOptions,
+    runtime.committedIsRestoring,
+    runtime.committedMemory,
+  );
 
   makeResult();
 
@@ -386,66 +442,157 @@ function useInfiniteRuntime(
       runtime.listener = onStoreChange;
       let subscribedQuery = query;
       let rebinding = false;
-      hub.retain(subscribedQuery, defaultedOptions.gcTime);
+      let retained = false;
+      const retainQuery = (target: AnyLiteQuery) => {
+        runtime.retainedQuery = target;
+        try {
+          hub.setQuerySemantics(target, runtime.querySemanticsKey, {
+            isActive: () =>
+              runtime.retainedQuery === target &&
+              resolveEnabled(runtime.committedOptions.enabled, target) !== false &&
+              runtime.committedOptions.queryFn !== skipToken,
+            isStatic: () =>
+              runtime.retainedQuery === target &&
+              resolveStaleTime(runtime.committedOptions.staleTime, target) === "static",
+            mayBeStatic:
+              typeof runtime.committedOptions.staleTime === "function" ||
+              runtime.committedOptions.staleTime === "static",
+          });
+          hub.retain(target, defaultedOptions.gcTime);
+        } catch (error) {
+          hub.clearQuerySemantics(runtime.querySemanticsKey);
+          if (runtime.retainedQuery === target) runtime.retainedQuery = undefined;
+          throw error;
+        }
+      };
+      const releaseRetention = () => {
+        try {
+          hub.clearQuerySemantics(runtime.querySemanticsKey);
+        } finally {
+          if (retained) hub.release(subscribedQuery);
+          retained = false;
+          if (runtime.retainedQuery === subscribedQuery) {
+            runtime.retainedQuery = undefined;
+          }
+        }
+      };
+      try {
+        retainQuery(subscribedQuery);
+        retained = true;
+      } catch (error) {
+        if (runtime.listener === onStoreChange) runtime.listener = undefined;
+        throw error;
+      }
       const switchQuery = (nextQuery: AnyLiteQuery) => {
         if (nextQuery === subscribedQuery) return;
-        hub.release(subscribedQuery);
+        try {
+          hub.clearQuerySemantics(runtime.querySemanticsKey);
+        } finally {
+          if (retained) hub.release(subscribedQuery);
+        }
+        retained = false;
         subscribedQuery = nextQuery;
-        hub.retain(subscribedQuery, defaultedOptions.gcTime);
+        retainQuery(subscribedQuery);
+        retained = true;
         runtime.query = subscribedQuery;
         runtime.autoFetchAttempted = false;
         runtime.wasAutoFetchEligible = false;
         resetMemoryForQuery(runtime.memory, subscribedQuery);
+        resetMemoryForQuery(runtime.committedMemory, subscribedQuery);
       };
-      const unsubscribeHash = hub.subscribeHash(query.queryHash, (event) => {
-        if (rebinding) return;
-        if (event.type === "removed" && event.query === subscribedQuery) {
-          rebinding = true;
-          try {
-            switchQuery(hub.buildQuery(runtime.options));
-          } finally {
-            rebinding = false;
+      let unsubscribeHash: () => void;
+      try {
+        unsubscribeHash = hub.subscribeHash(query.queryHash, (event) => {
+          if (rebinding) return;
+          if (event.type === "removed" && event.query === subscribedQuery) {
+            rebinding = true;
+            try {
+              switchQuery(hub.buildQuery(runtime.committedOptions));
+            } finally {
+              rebinding = false;
+            }
+          } else if (event.query !== subscribedQuery) {
+            switchQuery(event.query);
           }
-        } else if (event.query !== subscribedQuery) {
-          switchQuery(event.query);
-        }
-        if (runtime.query !== subscribedQuery) return;
-        const previous = runtime.memory.previousResult;
-        makeResult();
-        const next = runtime.memory.previousResult;
-        if (
-          liteResultChanged(
-            next as unknown as Record<string, unknown>,
-            previous as unknown as Record<string, unknown> | undefined,
-            runtime.options.notifyOnChangeProps,
-            runtime.memory.trackedProps,
-            runtime.options.throwOnError,
-          )
-        ) {
-          runtime.listener?.();
-        }
-        if (
-          event.type === "updated" &&
-          event.action.type === "invalidate" &&
-          resolveEnabled(runtime.options.enabled, subscribedQuery) !== false &&
-          runtime.options.queryFn !== skipToken
-        ) {
-          void subscribedQuery
-            .fetch(runtime.options, { cancelRefetch: false })
-            .catch(() => undefined);
-        }
-      });
-      const unregisterEnvironment = hub.registerEnvironment({
+          if (runtime.query !== subscribedQuery) return;
+          const previous = runtime.committedMemory.previousResult;
+          makeResult(
+            runtime.committedOptions,
+            runtime.committedIsRestoring,
+            runtime.committedMemory,
+          );
+          const next = runtime.committedMemory.previousResult;
+          if (
+            liteResultChanged(
+              next as unknown as Record<string, unknown>,
+              previous as unknown as Record<string, unknown> | undefined,
+              runtime.committedOptions.notifyOnChangeProps,
+              runtime.memory.trackedProps,
+              runtime.committedOptions.throwOnError,
+            )
+          ) {
+            runtime.listener?.();
+          }
+          if (
+            event.type === "updated" &&
+            event.action.type === "invalidate" &&
+            resolveEnabled(runtime.committedOptions.enabled, subscribedQuery) !== false &&
+            runtime.committedOptions.queryFn !== skipToken &&
+            resolveStaleTime(runtime.committedOptions.staleTime, subscribedQuery) !== "static" &&
+            !subscribedQuery.isActive()
+          ) {
+            const handled = hub.runActiveInvalidation(
+              subscribedQuery,
+              (fetchOptions) => subscribedQuery.fetch(
+                runtime.committedOptions,
+                fetchOptions,
+              ),
+            );
+            if (handled === undefined && !runtime.invalidationFetchScheduled) {
+              const invalidatedQuery = subscribedQuery;
+              runtime.invalidationFetchScheduled = true;
+              queueMicrotask(() => {
+                runtime.invalidationFetchScheduled = false;
+                if (
+                  runtime.listener === undefined ||
+                  runtime.committedIsRestoring ||
+                  runtime.committedOptions.subscribed === false ||
+                  runtime.query !== invalidatedQuery ||
+                  resolveEnabled(runtime.committedOptions.enabled, invalidatedQuery) === false ||
+                  runtime.committedOptions.queryFn === skipToken ||
+                  resolveStaleTime(
+                    runtime.committedOptions.staleTime,
+                    invalidatedQuery,
+                  ) === "static" ||
+                  invalidatedQuery.isActive() ||
+                  invalidatedQuery.state.fetchStatus !== "idle" ||
+                  !invalidatedQuery.state.isInvalidated
+                ) return;
+                void invalidatedQuery
+                  .fetch(runtime.committedOptions, { cancelRefetch: false })
+                  .catch(() => undefined);
+              });
+            }
+          }
+        });
+      } catch (error) {
+        releaseRetention();
+        if (runtime.listener === onStoreChange) runtime.listener = undefined;
+        throw error;
+      }
+      let unregisterEnvironment: () => void;
+      try {
+        unregisterEnvironment = hub.registerEnvironment({
         onFocus: () => {
           if (
             shouldFetchOnEnvironment(
               subscribedQuery,
-              runtime.options,
-              runtime.options.refetchOnWindowFocus,
+              runtime.committedOptions,
+              runtime.committedOptions.refetchOnWindowFocus,
             )
           ) {
             void subscribedQuery
-              .fetch(runtime.options, { cancelRefetch: false })
+              .fetch(runtime.committedOptions, { cancelRefetch: false })
               .catch(() => undefined);
           }
         },
@@ -453,20 +600,26 @@ function useInfiniteRuntime(
           if (
             shouldFetchOnEnvironment(
               subscribedQuery,
-              runtime.options,
-              runtime.options.refetchOnReconnect,
+              runtime.committedOptions,
+              runtime.committedOptions.refetchOnReconnect,
             )
           ) {
             void subscribedQuery
-              .fetch(runtime.options, { cancelRefetch: false })
+              .fetch(runtime.committedOptions, { cancelRefetch: false })
               .catch(() => undefined);
           }
         },
-      });
+        });
+      } catch (error) {
+        unsubscribeHash();
+        releaseRetention();
+        if (runtime.listener === onStoreChange) runtime.listener = undefined;
+        throw error;
+      }
       return () => {
         unsubscribeHash();
         unregisterEnvironment();
-        hub.release(subscribedQuery);
+        releaseRetention();
         if (runtime.listener === onStoreChange) {
           runtime.listener = undefined;
         }
@@ -488,6 +641,31 @@ function useInfiniteRuntime(
   );
   useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
+  useLayoutEffect(() => {
+    runtime.committedOptions = defaultedOptions;
+    runtime.committedIsRestoring = isRestoring;
+    runtime.committedMemory = cloneInfiniteMemory(runtime.memory);
+    query.setOptions(defaultedOptions);
+    if (runtime.retainedQuery) {
+      hub.setQuerySemantics(
+        runtime.retainedQuery,
+        runtime.querySemanticsKey,
+        {
+          isActive: () =>
+            runtime.retainedQuery !== undefined &&
+            resolveEnabled(runtime.committedOptions.enabled, runtime.retainedQuery) !== false &&
+            runtime.committedOptions.queryFn !== skipToken,
+          isStatic: () =>
+            runtime.retainedQuery !== undefined &&
+            resolveStaleTime(runtime.committedOptions.staleTime, runtime.retainedQuery) === "static",
+          mayBeStatic:
+            typeof runtime.committedOptions.staleTime === "function" ||
+            runtime.committedOptions.staleTime === "static",
+        },
+      );
+    }
+  });
+
   useEffect(() => {
     if ((defaultedOptions as { experimental_prefetchInRender?: boolean }).experimental_prefetchInRender) {
       warnUnsupportedOption("experimental_prefetchInRender");
@@ -504,9 +682,11 @@ function useInfiniteRuntime(
     if (!eligible) {
       return;
     }
-    if (!runtime.autoFetchAttempted && shouldFetchOnMount(query, defaultedOptions)) {
+    if (!runtime.autoFetchAttempted) {
       runtime.autoFetchAttempted = true;
-      void query.fetch(defaultedOptions).catch(() => undefined);
+      if (shouldFetchOnMount(query, defaultedOptions)) {
+        void query.fetch(defaultedOptions).catch(() => undefined);
+      }
     }
   }, [
     defaultedOptions.enabled,
@@ -532,16 +712,20 @@ function useInfiniteRuntime(
         query.state.dataUpdatedAt + staleTime + 1,
         () => {
           if (runtime.query !== query) return;
-          const previous = runtime.memory.previousResult;
-          makeResult();
-          const next = runtime.memory.previousResult;
+          const previous = runtime.committedMemory.previousResult;
+          makeResult(
+            runtime.committedOptions,
+            runtime.committedIsRestoring,
+            runtime.committedMemory,
+          );
+          const next = runtime.committedMemory.previousResult;
           if (
             liteResultChanged(
               next as unknown as Record<string, unknown>,
               previous as unknown as Record<string, unknown> | undefined,
-              runtime.options.notifyOnChangeProps,
+              runtime.committedOptions.notifyOnChangeProps,
               runtime.memory.trackedProps,
-              runtime.options.throwOnError,
+              runtime.committedOptions.throwOnError,
             )
           ) {
             runtime.listener?.();
@@ -560,12 +744,14 @@ function useInfiniteRuntime(
     runtime.memory.previousResult?.dataUpdatedAt,
   ]);
 
+  const resolvedRefetchInterval =
+    typeof defaultedOptions.refetchInterval === "function"
+      ? defaultedOptions.refetchInterval(query)
+      : defaultedOptions.refetchInterval;
+
   useEffect(() => {
     if (isRestoring || defaultedOptions.subscribed === false) return;
-    const interval =
-      typeof defaultedOptions.refetchInterval === "function"
-        ? defaultedOptions.refetchInterval(query)
-        : defaultedOptions.refetchInterval;
+    const interval = resolvedRefetchInterval;
     if (typeof interval !== "number" || interval <= 0 || interval === Infinity) {
       hub.cancelInterval(intervalTimerKey.current!);
       return () => hub.cancelInterval(intervalTimerKey.current!);
@@ -573,24 +759,22 @@ function useInfiniteRuntime(
     hub.scheduleInterval(intervalTimerKey.current!, {
       interval,
       inBackground: () =>
-        defaultedOptions.refetchIntervalInBackground === true ||
+        runtime.committedOptions.refetchIntervalInBackground === true ||
         focusManager.isFocused(),
       callback: () => {
-        if (runtime.isRestoring) return;
+        if (runtime.committedIsRestoring) return;
         const currentQuery = runtime.query;
-        if (resolveEnabled(runtime.options.enabled, currentQuery) === false) return;
-        void currentQuery.fetch(runtime.options).catch(() => undefined);
+        if (resolveEnabled(runtime.committedOptions.enabled, currentQuery) === false) return;
+        void currentQuery.fetch(runtime.committedOptions).catch(() => undefined);
       },
     });
     return () => hub.cancelInterval(intervalTimerKey.current!);
   }, [
-    defaultedOptions.enabled,
-    defaultedOptions.refetchInterval,
-    defaultedOptions.refetchIntervalInBackground,
     defaultedOptions.subscribed,
     hub,
     isRestoring,
     query,
+    resolvedRefetchInterval,
   ]);
 
   return runtime;

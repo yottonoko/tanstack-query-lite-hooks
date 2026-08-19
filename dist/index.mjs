@@ -1,10 +1,237 @@
-import { useQueryClient, useIsRestoring, skipToken, shouldThrowError, focusManager, onlineManager, replaceEqualDeep } from '@tanstack/react-query';
+import { useQueryClient, useIsRestoring, skipToken, shouldThrowError, focusManager, matchQuery, onlineManager, replaceEqualDeep } from '@tanstack/react-query';
 export { infiniteQueryOptions, infiniteQueryOptions as infiniteQueryOptionsLite, queryOptions, queryOptions as queryOptionsLite, skipToken, skipToken as skipTokenLite, useQueryClient, useQueryClient as useQueryClientLite } from '@tanstack/react-query';
 import { useCallback, useSyncExternalStore, useLayoutEffect, useEffect, useMemo, useRef } from 'react';
 
 // src/index.ts
 var hubs = /* @__PURE__ */ new WeakMap();
+var invalidationPatches = /* @__PURE__ */ new WeakMap();
+var invalidationContexts = /* @__PURE__ */ new WeakMap();
+var liteQueryLeases = /* @__PURE__ */ new WeakMap();
+var liteQueryLeaseOwners = /* @__PURE__ */ new WeakMap();
+var liteQueryMethodPatches = /* @__PURE__ */ new WeakMap();
+var sharedRetainedQueries = /* @__PURE__ */ new WeakMap();
 var MAX_TIMER_DELAY = 2147483647;
+function queryLeases(cache, query) {
+  return liteQueryLeases.get(cache)?.get(query);
+}
+function isLiteActive(cache, query) {
+  for (const semantics of queryLeases(cache, query)?.values() ?? []) {
+    if (semantics.isActive()) return true;
+  }
+  return false;
+}
+function isLiteStatic(cache, query) {
+  for (const semantics of queryLeases(cache, query)?.values() ?? []) {
+    if (semantics.isStatic()) return true;
+  }
+  return false;
+}
+function restoreQueryMethod(query, name, descriptor) {
+  if (descriptor) Object.defineProperty(query, name, descriptor);
+  else Reflect.deleteProperty(query, name);
+}
+function restoreQueryMethods(query) {
+  const patch = liteQueryMethodPatches.get(query);
+  if (!patch) return;
+  restoreQueryMethod(query, "isActive", patch.activeDescriptor);
+  restoreQueryMethod(query, "isDisabled", patch.disabledDescriptor);
+  if (patch.staticInstalled) {
+    restoreQueryMethod(query, "isStatic", patch.staticDescriptor);
+  }
+  liteQueryMethodPatches.delete(query);
+}
+function liteQueryIsActive() {
+  const patch = liteQueryMethodPatches.get(this);
+  return patch.nativeIsActive.call(this) || isLiteActive(patch.cache, this);
+}
+function liteQueryIsDisabled() {
+  const patch = liteQueryMethodPatches.get(this);
+  if ((queryLeases(patch.cache, this)?.size ?? 0) > 0) {
+    return !liteQueryIsActive.call(this);
+  }
+  return patch.nativeIsDisabled.call(this);
+}
+function liteQueryIsStatic() {
+  const patch = liteQueryMethodPatches.get(this);
+  return patch.nativeIsStatic.call(this) || isLiteStatic(patch.cache, this);
+}
+function installStaticQueryMethod(query, patch) {
+  if (patch.staticInstalled) return;
+  const descriptor = Object.getOwnPropertyDescriptor(query, "isStatic");
+  if (!descriptor && !Object.isExtensible(query)) {
+    throw new TypeError(
+      "[tanstack-query-lite-hooks] Query semantic methods cannot be installed on a non-extensible Query."
+    );
+  }
+  if (descriptor && descriptor.configurable !== true) {
+    throw new TypeError(
+      "[tanstack-query-lite-hooks] Query semantic methods require configurable own method descriptors."
+    );
+  }
+  const nativeIsStatic = query.isStatic;
+  try {
+    Object.defineProperty(query, "isStatic", {
+      configurable: true,
+      writable: true,
+      value: liteQueryIsStatic
+    });
+  } catch (error) {
+    restoreQueryMethod(query, "isStatic", descriptor);
+    throw error;
+  }
+  patch.staticDescriptor = descriptor;
+  patch.nativeIsStatic = nativeIsStatic;
+  patch.staticInstalled = true;
+}
+function ensureQueryMethods(cache, query, includeStatic) {
+  const current = liteQueryMethodPatches.get(query);
+  if (current) {
+    if (includeStatic) installStaticQueryMethod(query, current);
+    return;
+  }
+  const patch = {
+    cache,
+    activeDescriptor: Object.getOwnPropertyDescriptor(query, "isActive"),
+    disabledDescriptor: Object.getOwnPropertyDescriptor(query, "isDisabled"),
+    nativeIsActive: query.isActive,
+    nativeIsDisabled: query.isDisabled,
+    staticDescriptor: void 0,
+    nativeIsStatic: void 0,
+    staticInstalled: false
+  };
+  if ((!patch.activeDescriptor || !patch.disabledDescriptor) && !Object.isExtensible(query)) {
+    throw new TypeError(
+      "[tanstack-query-lite-hooks] Query semantic methods cannot be installed on a non-extensible Query."
+    );
+  }
+  if (patch.activeDescriptor && patch.activeDescriptor.configurable !== true || patch.disabledDescriptor && patch.disabledDescriptor.configurable !== true) {
+    throw new TypeError(
+      "[tanstack-query-lite-hooks] Query semantic methods require configurable own method descriptors."
+    );
+  }
+  try {
+    Object.defineProperties(query, {
+      isActive: {
+        configurable: true,
+        writable: true,
+        value: liteQueryIsActive
+      },
+      isDisabled: {
+        configurable: true,
+        writable: true,
+        value: liteQueryIsDisabled
+      }
+    });
+  } catch (error) {
+    restoreQueryMethod(query, "isActive", patch.activeDescriptor);
+    restoreQueryMethod(query, "isDisabled", patch.disabledDescriptor);
+    throw error;
+  }
+  liteQueryMethodPatches.set(query, patch);
+  if (includeStatic) {
+    try {
+      installStaticQueryMethod(query, patch);
+    } catch (error) {
+      restoreQueryMethod(query, "isActive", patch.activeDescriptor);
+      restoreQueryMethod(query, "isDisabled", patch.disabledDescriptor);
+      liteQueryMethodPatches.delete(query);
+      throw error;
+    }
+  }
+}
+function clearLiteQueryLease(lease) {
+  const owner = liteQueryLeaseOwners.get(lease);
+  if (!owner) return;
+  const queries = liteQueryLeases.get(owner.cache);
+  const leases = queries?.get(owner.query);
+  leases?.delete(lease);
+  if (leases?.size === 0) {
+    queries?.delete(owner.query);
+    restoreQueryMethods(owner.query);
+  }
+  if (queries?.size === 0) liteQueryLeases.delete(owner.cache);
+  liteQueryLeaseOwners.delete(lease);
+}
+function setLiteQueryLease(cache, query, lease, semantics) {
+  ensureQueryMethods(
+    cache,
+    query,
+    semantics.mayBeStatic === true
+  );
+  const owner = liteQueryLeaseOwners.get(lease);
+  if (owner && (owner.cache !== cache || owner.query !== query)) {
+    clearLiteQueryLease(lease);
+  }
+  let queries = liteQueryLeases.get(cache);
+  if (!queries) {
+    queries = /* @__PURE__ */ new Map();
+    liteQueryLeases.set(cache, queries);
+  }
+  let leases = queries.get(query);
+  if (!leases) {
+    leases = /* @__PURE__ */ new Map();
+    queries.set(query, leases);
+  }
+  leases.set(lease, semantics);
+  liteQueryLeaseOwners.set(lease, { cache, query });
+}
+function installInvalidationTracking(client, cache) {
+  if (invalidationPatches.has(client)) return;
+  const initialImplementation = client.invalidateQueries;
+  const patch = {
+    wrapper: void 0
+  };
+  const createTrackedInvalidate = (implementation) => {
+    const trackedInvalidate = (filters, options) => {
+      const context = {
+        filters,
+        refetchType: filters?.refetchType ?? filters?.type ?? "active",
+        cancelRefetch: options?.cancelRefetch ?? true,
+        throwOnError: options?.throwOnError === true,
+        rawRefetches: /* @__PURE__ */ new Map(),
+        refetches: /* @__PURE__ */ new Map(),
+        synchronous: true
+      };
+      let stack = invalidationContexts.get(cache);
+      if (!stack) {
+        stack = [];
+        invalidationContexts.set(cache, stack);
+      }
+      stack.push(context);
+      let nativePromise;
+      try {
+        nativePromise = implementation.call(client, filters, options);
+      } catch (error) {
+        const index = stack.lastIndexOf(context);
+        if (index !== -1) stack.splice(index, 1);
+        if (stack.length === 0) invalidationContexts.delete(cache);
+        throw error;
+      } finally {
+        context.synchronous = false;
+      }
+      return nativePromise.then(() => Promise.all(context.refetches.values())).then(() => void 0).finally(() => {
+        const index = stack.lastIndexOf(context);
+        if (index !== -1) stack.splice(index, 1);
+        if (stack.length === 0) invalidationContexts.delete(cache);
+      });
+    };
+    return trackedInvalidate;
+  };
+  patch.wrapper = createTrackedInvalidate(initialImplementation);
+  Object.defineProperty(client, "invalidateQueries", {
+    configurable: true,
+    enumerable: false,
+    get: () => patch.wrapper,
+    set: (implementation) => {
+      if (implementation === patch.wrapper) return;
+      if (typeof implementation !== "function") {
+        throw new TypeError("QueryClient.invalidateQueries must be a function");
+      }
+      patch.wrapper = createTrackedInvalidate(implementation);
+    }
+  });
+  invalidationPatches.set(client, patch);
+}
 function delayUntil(deadline) {
   return Math.min(Math.max(deadline - Date.now(), 0), MAX_TIMER_DELAY);
 }
@@ -23,6 +250,64 @@ function clearQueryGcTimeout(query) {
     );
   }
   candidate.clearGcTimeout();
+}
+function sharedRetentionMap(cache) {
+  let retained = sharedRetainedQueries.get(cache);
+  if (!retained) {
+    retained = /* @__PURE__ */ new Map();
+    sharedRetainedQueries.set(cache, retained);
+  }
+  return retained;
+}
+function extendGcTime(retained, gcTime) {
+  if (gcTime === Infinity) {
+    retained.gcTime = Infinity;
+  } else if (validTimeout(gcTime)) {
+    retained.gcTime = Math.max(retained.gcTime, gcTime);
+  }
+}
+function retainSharedQuery(cache, query, gcTime) {
+  const initialGcTime = queryGcTime(query);
+  const previousGcTime = query.gcTime;
+  query.gcTime = Infinity;
+  try {
+    clearQueryGcTimeout(query);
+  } catch (error) {
+    query.gcTime = previousGcTime;
+    throw error;
+  }
+  const retainedQueries = sharedRetentionMap(cache);
+  let retained = retainedQueries.get(query);
+  if (!retained) {
+    retained = { leases: 0, gcTime: initialGcTime };
+    retainedQueries.set(query, retained);
+  }
+  extendGcTime(retained, gcTime);
+  retained.leases += 1;
+}
+function noteSharedGcTime(cache, query, gcTime) {
+  const retained = sharedRetainedQueries.get(cache)?.get(query);
+  if (retained) extendGcTime(retained, gcTime);
+}
+function releaseSharedQuery(cache, query, gcTime) {
+  const retainedQueries = sharedRetainedQueries.get(cache);
+  const retained = retainedQueries?.get(query);
+  if (!retained) return void 0;
+  extendGcTime(retained, gcTime);
+  retained.leases -= 1;
+  if (retained.leases > 0) {
+    query.gcTime = Infinity;
+    return { remaining: true, gcTime: retained.gcTime };
+  }
+  retainedQueries.delete(query);
+  query.gcTime = retained.gcTime;
+  return { remaining: false, gcTime: retained.gcTime };
+}
+function isSharedQueryRetained(cache, query) {
+  return (sharedRetainedQueries.get(cache)?.get(query)?.leases ?? 0) > 0;
+}
+function forgetSharedQuery(cache, query) {
+  sharedRetainedQueries.get(cache)?.delete(query);
 }
 var LiteHub = class {
   client;
@@ -47,8 +332,41 @@ var LiteHub = class {
     this.client = client;
     this.cache = client.getQueryCache();
   }
+  /** QueryClient の active invalidate に Lite-only refetch を合流する。 */
+  runActiveInvalidation(query, fetch) {
+    const contexts = invalidationContexts.get(this.cache);
+    if (!contexts) return void 0;
+    let synchronous;
+    for (let index = contexts.length - 1; index >= 0; index -= 1) {
+      if (contexts[index].synchronous) {
+        synchronous = contexts[index];
+        break;
+      }
+    }
+    const matching = synchronous ? [synchronous] : contexts.filter((context) => matchQuery(context.filters ?? {}, query));
+    if (matching.length === 0) return void 0;
+    const active = matching.filter((context) => context.refetchType === "active");
+    if (active.length === 0) return false;
+    let request = active.map((context) => context.rawRefetches.get(query)).find((candidate) => candidate !== void 0);
+    if (!request) {
+      request = fetch({ cancelRefetch: active.at(-1).cancelRefetch });
+    }
+    for (const context of active) {
+      if (context.refetches.has(query)) continue;
+      context.rawRefetches.set(query, request);
+      const tracked = context.throwOnError ? request : request.catch(() => void 0);
+      if (query.state.fetchStatus === "paused") {
+        void tracked.catch(() => void 0);
+        context.refetches.set(query, Promise.resolve());
+      } else {
+        context.refetches.set(query, tracked);
+      }
+    }
+    return true;
+  }
   /** キャッシュへの実購読は Hub ごとに最大一つだけ作る */
   ensureExternalSubscriptions() {
+    installInvalidationTracking(this.client, this.cache);
     if (!this.cacheUnsubscribe) {
       this.cacheUnsubscribe = this.cache.subscribe((event) => {
         this.onCacheEvent(event);
@@ -128,6 +446,7 @@ var LiteHub = class {
     if (event.type === "removed") {
       this.gcCandidates.delete(query);
       this.retained.delete(query);
+      forgetSharedQuery(this.cache, query);
     }
     const listeners = this.hashListeners.get(hash);
     if (listeners) {
@@ -147,7 +466,7 @@ var LiteHub = class {
   }
   /** QueryCache.build の共有入口。Query はイベント購読中にだけ作成する */
   buildQuery(options) {
-    const defaulted = this.client.defaultQueryOptions(options);
+    const defaulted = options._defaulted === true ? options : this.client.defaultQueryOptions(options);
     return this.cache.build(this.client, defaulted);
   }
   /** Direct Query.fetch を利用して共有 dedupe/retry/cancel を維持する */
@@ -155,18 +474,12 @@ var LiteHub = class {
     return query.fetch(options, fetchOptions);
   }
   retain(query, gcTime) {
+    installInvalidationTracking(this.client, this.cache);
+    retainSharedQuery(this.cache, query, gcTime);
     let retained = this.retained.get(query);
     if (!retained) {
-      retained = {
-        leases: 0,
-        gcTime: queryGcTime(query)
-      };
+      retained = { leases: 0 };
       this.retained.set(query, retained);
-    }
-    if (validTimeout(gcTime)) {
-      retained.gcTime = Math.max(retained.gcTime, gcTime);
-    } else if (gcTime === Infinity) {
-      retained.gcTime = Infinity;
     }
     retained.leases++;
     this.gcCandidates.delete(query);
@@ -175,27 +488,32 @@ var LiteHub = class {
       this.gcTimer = void 0;
       this.gcTimerDeadline = void 0;
     }
-    clearQueryGcTimeout(query);
-    query.gcTime = Infinity;
   }
   noteGcTime(query, gcTime) {
     const retained = this.retained.get(query);
     if (!retained || gcTime === void 0) return;
-    retained.gcTime = gcTime === Infinity ? Infinity : Math.max(retained.gcTime, gcTime);
+    noteSharedGcTime(this.cache, query, gcTime);
+  }
+  /** commit 済み Lite subscription の active/static 判定を共有する。 */
+  setQuerySemantics(query, lease, semantics) {
+    setLiteQueryLease(this.cache, query, lease, semantics);
+  }
+  /** この subscription が保持していた active/static 判定を解除する。 */
+  clearQuerySemantics(lease) {
+    const owner = liteQueryLeaseOwners.get(lease);
+    if (owner?.cache !== this.cache) return;
+    clearLiteQueryLease(lease);
   }
   release(query) {
     const retained = this.retained.get(query);
     if (!retained) return;
     retained.leases--;
-    if (retained.leases > 0) return;
     const optionGcTime = query.options.gcTime;
-    if (typeof optionGcTime === "number") {
-      retained.gcTime = optionGcTime === Infinity ? Infinity : Math.max(retained.gcTime, optionGcTime);
-    }
+    const shared = releaseSharedQuery(this.cache, query, optionGcTime);
+    if (retained.leases > 0) return;
     this.retained.delete(query);
-    query.gcTime = retained.gcTime;
-    if (query.getObserversCount() === 0) {
-      this.scheduleReleasedQuery(query, retained.gcTime);
+    if (shared && !shared.remaining && query.getObserversCount() === 0) {
+      this.scheduleReleasedQuery(query, shared.gcTime);
     }
     this.maybeReleaseExternalSubscriptions();
   }
@@ -213,6 +531,10 @@ var LiteHub = class {
   }
   flushGcCandidate(candidate) {
     const { query } = candidate;
+    if (isSharedQueryRetained(this.cache, query)) {
+      this.gcCandidates.delete(query);
+      return;
+    }
     if (this.retained.has(query)) {
       this.gcCandidates.delete(query);
       return;
@@ -353,7 +675,9 @@ var LiteHub = class {
   }
   destroy() {
     for (const [query, retained] of this.retained) {
-      query.gcTime = retained.gcTime;
+      for (let lease = 0; lease < retained.leases; lease += 1) {
+        releaseSharedQuery(this.cache, query, query.options.gcTime);
+      }
     }
     this.cacheUnsubscribe?.();
     this.cacheUnsubscribe = void 0;
@@ -672,6 +996,8 @@ var LiteQueryEntry = class {
   queryInitialState;
   trackedProps = /* @__PURE__ */ new Set();
   selectState = {
+    selectFn: void 0,
+    selectResult: void 0,
     selectError: null
   };
   options;
@@ -690,19 +1016,38 @@ var LiteQueryEntry = class {
   hasCommit = false;
   staleTimerKey = {};
   intervalTimerKey = {};
+  querySemanticsKey = {};
   isRestoring = false;
+  // 未 commit の concurrent render が live subscription の callback を置き換えないよう分離する。
+  committedOptions;
+  committedIsRestoring = false;
+  committedRawResult;
+  committedPreviousResultState;
+  committedPreviousResultOptions;
+  committedLastQueryWithDefinedData;
+  committedSelectState = {
+    selectFn: void 0,
+    selectResult: void 0,
+    selectError: null
+  };
   rebinding = false;
+  invalidationFetchScheduled = false;
   constructor(client, hub, options, previous, query) {
     this.client = client;
     this.hub = hub;
     this.options = options;
+    this.committedOptions = options;
     this.query = query ?? hub.buildQuery(options);
     this.hash = this.query.queryHash;
     this.queryInitialState = this.query.state;
-    this.previousResult = previous?.rawResult;
+    this.previousResult = previous?.committedRawResult ?? previous?.rawResult;
     this.previousResultState = previous?.query.state;
     this.previousResultOptions = previous?.options;
     this.lastQueryWithDefinedData = previous?.query.state.data === void 0 ? void 0 : previous.query;
+    this.committedRawResult = previous?.committedRawResult;
+    this.committedPreviousResultState = previous?.committedPreviousResultState;
+    this.committedPreviousResultOptions = previous?.committedPreviousResultOptions;
+    this.committedLastQueryWithDefinedData = previous?.committedLastQueryWithDefinedData;
   }
   update(options, isRestoring = false) {
     if (this.options !== options || this.isRestoring !== isRestoring) {
@@ -716,33 +1061,62 @@ var LiteQueryEntry = class {
     const previousQuery = this.query;
     this.previousResultState = previousQuery.state;
     if (previousQuery.state.data !== void 0) this.lastQueryWithDefinedData = previousQuery;
-    if (this.lease) this.hub.release(previousQuery);
+    if (this.lease) {
+      try {
+        this.hub.clearQuerySemantics(this.querySemanticsKey);
+      } finally {
+        this.hub.release(previousQuery);
+      }
+    }
     this.query = query;
     this.queryInitialState = query.state;
     this.currentPromise = void 0;
     this.rawResult = void 0;
     this.trackedResult = void 0;
+    this.committedRawResult = void 0;
+    this.committedPreviousResultState = previousQuery.state;
+    this.committedPreviousResultOptions = this.committedOptions;
+    this.committedLastQueryWithDefinedData = previousQuery.state.data === void 0 ? void 0 : previousQuery;
+    this.committedSelectState.selectFn = void 0;
+    this.committedSelectState.selectResult = void 0;
+    this.committedSelectState.selectError = null;
     this.resultDirty = true;
     this.autoFetchAttempted = false;
     this.wasAutoFetchEligible = false;
-    if (this.hasCommit) this.applyOptions();
-    if (this.lease) this.hub.retain(query, this.options.gcTime);
+    if (this.hasCommit) this.applyOptions(this.committedOptions);
+    if (this.lease) {
+      try {
+        this.updateQuerySemantics(query);
+        this.hub.retain(query, this.committedOptions.gcTime);
+      } catch (error) {
+        this.lease = false;
+        this.hub.clearQuerySemantics(this.querySemanticsKey);
+        throw error;
+      }
+    }
   }
-  applyOptions() {
-    this.query.setOptions(this.options);
+  applyOptions(options) {
+    this.query.setOptions(options);
   }
-  resultContext() {
+  updateQuerySemantics(query = this.query) {
+    this.hub.setQuerySemantics(query, this.querySemanticsKey, {
+      isActive: () => this.query === query && isEnabled(this.committedOptions, query) && !isSkipped(this.committedOptions),
+      isStatic: () => this.query === query && resolveStaleTime2(this.committedOptions.staleTime, query) === "static",
+      mayBeStatic: typeof this.committedOptions.staleTime === "function" || this.committedOptions.staleTime === "static"
+    });
+  }
+  resultContext(options = this.options, isRestoring = this.isRestoring) {
     const fallback = this.query.state.data;
     const promise = asPromise(
       this.currentPromise ?? this.query.promise,
       fallback
     );
-    const useOptimisticFetchState = !this.hasCommit && !this.isRestoring && this.options.subscribed !== false && this.query.state.status === "pending" && this.query.state.fetchStatus === "idle" && isEnabled(this.options, this.query) && !isSkipped(this.options);
+    const useOptimisticFetchState = !this.hasCommit && !isRestoring && options.subscribed !== false && this.query.state.status === "pending" && this.query.state.fetchStatus === "idle" && isEnabled(options, this.query) && !isSkipped(options);
     return {
       query: this.query,
       state: useOptimisticFetchState ? { ...this.query.state, fetchStatus: "fetching" } : this.query.state,
       queryInitialState: this.queryInitialState,
-      options: this.options,
+      options,
       previousResult: this.rawResult,
       previousResultState: this.previousResultState,
       previousResultOptions: this.previousResultOptions,
@@ -752,10 +1126,10 @@ var LiteQueryEntry = class {
       promise
     };
   }
-  computeResult() {
-    const next = createLiteQueryResult(this.resultContext());
+  computeResult(options = this.options, isRestoring = this.isRestoring) {
+    const next = createLiteQueryResult(this.resultContext(options, isRestoring));
     this.previousResultState = this.query.state;
-    this.previousResultOptions = this.options;
+    this.previousResultOptions = options;
     if (this.query.state.data !== void 0) this.lastQueryWithDefinedData = this.query;
     this.rawResult = next;
     return next;
@@ -775,17 +1149,63 @@ var LiteQueryEntry = class {
     this.snapshot();
     return this.rawResult;
   }
+  computeCommittedResult() {
+    const fallback = this.query.state.data;
+    const next = createLiteQueryResult({
+      query: this.query,
+      state: this.query.state,
+      queryInitialState: this.queryInitialState,
+      options: this.committedOptions,
+      previousResult: this.committedRawResult,
+      previousResultState: this.committedPreviousResultState,
+      previousResultOptions: this.committedPreviousResultOptions,
+      lastQueryWithDefinedData: this.committedLastQueryWithDefinedData,
+      selectState: this.committedSelectState,
+      refetch: this.refetch,
+      promise: asPromise(
+        this.currentPromise ?? this.query.promise,
+        fallback
+      )
+    });
+    this.committedRawResult = next;
+    this.committedPreviousResultState = this.query.state;
+    this.committedPreviousResultOptions = this.committedOptions;
+    if (this.query.state.data !== void 0) {
+      this.committedLastQueryWithDefinedData = this.query;
+    }
+    return next;
+  }
+  syncRenderResultFromCommitted(next) {
+    this.rawResult = next;
+    this.previousResultState = this.committedPreviousResultState;
+    this.previousResultOptions = this.committedPreviousResultOptions;
+    this.lastQueryWithDefinedData = this.committedLastQueryWithDefinedData;
+    this.selectState.selectFn = this.committedSelectState.selectFn;
+    this.selectState.selectResult = this.committedSelectState.selectResult;
+    this.selectState.selectError = this.committedSelectState.selectError;
+  }
+  commitRenderResult() {
+    if (!this.rawResult) return;
+    this.committedRawResult = this.rawResult;
+    this.committedPreviousResultState = this.previousResultState;
+    this.committedPreviousResultOptions = this.previousResultOptions;
+    this.committedLastQueryWithDefinedData = this.lastQueryWithDefinedData;
+    this.committedSelectState.selectFn = this.selectState.selectFn;
+    this.committedSelectState.selectResult = this.selectState.selectResult;
+    this.committedSelectState.selectError = this.selectState.selectError;
+  }
   emitChanged() {
     this.resultDirty = true;
-    const previous = this.rawResult;
-    const next = this.computeResult();
+    const previous = this.committedRawResult;
+    const next = this.computeCommittedResult();
+    this.syncRenderResultFromCommitted(next);
     this.resultDirty = false;
     const changed = liteResultChanged(
       next,
       previous,
-      this.options.notifyOnChangeProps,
+      this.committedOptions.notifyOnChangeProps,
       this.trackedProps,
-      this.options.throwOnError
+      this.committedOptions.throwOnError
     );
     if (changed) {
       this.trackedResult = trackLiteResult(next, this.trackedProps, (key) => {
@@ -796,27 +1216,51 @@ var LiteQueryEntry = class {
     return changed;
   }
   onCacheEvent(event) {
+    const options = this.committedOptions;
     const cacheEvent = event;
     if (cacheEvent.query && cacheEvent.query !== this.query) {
       this.rebind(cacheEvent.query);
     } else if (cacheEvent.type === "removed" && !this.rebinding) {
       this.rebinding = true;
       try {
-        this.rebind(this.hub.buildQuery(this.options));
+        this.rebind(this.hub.buildQuery(this.committedOptions));
       } finally {
         this.rebinding = false;
       }
     }
     const action = cacheEvent.action;
-    if (action?.type === "invalidate" && this.hasCommit && !this.isRestoring && this.options.subscribed !== false && isEnabled(this.options, this.query) && !isSkipped(this.options)) {
-      this.autoFetchAttempted = true;
-      void this.runFetch({ cancelRefetch: false }).catch(() => void 0);
+    if (action?.type === "invalidate" && this.hasCommit && !this.committedIsRestoring && options.subscribed !== false && isEnabled(options, this.query) && !isSkipped(options) && resolveStaleTime2(options.staleTime, this.query) !== "static" && !this.query.isActive()) {
+      const handled = this.hub.runActiveInvalidation(
+        this.query,
+        (fetchOptions) => {
+          this.autoFetchAttempted = true;
+          return this.runFetch(fetchOptions);
+        }
+      );
+      if (handled === void 0) this.scheduleInvalidationFetch();
     }
     return this.emitChanged();
+  }
+  scheduleInvalidationFetch() {
+    if (this.invalidationFetchScheduled) return;
+    const invalidatedQuery = this.query;
+    this.invalidationFetchScheduled = true;
+    queueMicrotask(() => {
+      this.invalidationFetchScheduled = false;
+      if (this.query !== invalidatedQuery || !this.hasCommit || this.committedIsRestoring || this.committedOptions.subscribed === false || !isEnabled(this.committedOptions, invalidatedQuery) || isSkipped(this.committedOptions) || resolveStaleTime2(
+        this.committedOptions.staleTime,
+        invalidatedQuery
+      ) === "static" || invalidatedQuery.isActive() || invalidatedQuery.state.fetchStatus !== "idle" || !invalidatedQuery.state.isInvalidated) return;
+      this.autoFetchAttempted = true;
+      void this.runFetch({ cancelRefetch: false }).catch(() => void 0);
+    });
   }
   addResultListener(listener) {
     this.resultListeners.add(listener);
     return () => this.resultListeners.delete(listener);
+  }
+  isCommittedSubscribed() {
+    return !this.committedIsRestoring && this.committedOptions.subscribed !== false;
   }
   subscribe(listener) {
     if (this.isRestoring || this.options.subscribed === false) return () => void 0;
@@ -837,18 +1281,19 @@ var LiteQueryEntry = class {
   autoFetchAttempted = false;
   wasAutoFetchEligible = false;
   shouldAutoFetch() {
-    if (!this.hasCommit || this.isRestoring || this.options.subscribed === false) return false;
-    if (!isEnabled(this.options, this.query) || isSkipped(this.options)) return false;
-    if (this.query.state.status === "error" && this.options.retryOnMount === false) return false;
+    const options = this.committedOptions;
+    if (!this.hasCommit || this.committedIsRestoring || options.subscribed === false) return false;
+    if (!isEnabled(options, this.query) || isSkipped(options)) return false;
+    if (this.query.state.status === "error" && options.retryOnMount === false) return false;
     if (this.query.state.data === void 0) return true;
-    const policy = resolveRefetchPolicy(this.options.refetchOnMount, this.query);
+    const policy = resolveRefetchPolicy(options.refetchOnMount, this.query);
     if (policy === "always") return true;
     if (policy === false) return false;
-    return isStale(this.options, this.query);
+    return isStale(options, this.query);
   }
-  runFetch(fetchOptions) {
-    this.applyOptions();
-    const pending = this.hub.fetch(this.query, this.options, fetchOptions);
+  runFetch(fetchOptions, options = this.committedOptions) {
+    this.applyOptions(options);
+    const pending = this.hub.fetch(this.query, options, fetchOptions);
     this.currentPromise = pending;
     void pending.then(
       () => {
@@ -865,47 +1310,85 @@ var LiteQueryEntry = class {
     if (this.query.state.status === "error" && this.query.state.fetchStatus === "idle") {
       return void 0;
     }
-    if (this.query.state.data !== void 0) {
-      if (this.query.promise) return void 0;
-      if (!isStale(this.options, this.query)) return void 0;
-      void this.runFetch({ cancelRefetch: false }).catch(() => void 0);
-      return void 0;
-    }
+    if (this.query.state.data !== void 0) return void 0;
     if (this.query.promise) return this.query.promise;
-    return this.runFetch({ cancelRefetch: false });
+    return this.runFetch({ cancelRefetch: false }, this.options);
   }
-  afterCommit() {
-    this.applyOptions();
+  afterCommit(options = this.committedOptions, isRestoring = this.committedIsRestoring) {
+    if (this.committedOptions !== options || this.committedIsRestoring !== isRestoring) return;
+    this.applyOptions(options);
     this.hasCommit = true;
-    const eligible = !this.isRestoring && isEnabled(this.options, this.query) && !isSkipped(this.options);
+    const eligible = !isRestoring && options.subscribed !== false && isEnabled(options, this.query) && !isSkipped(options);
     if (eligible && !this.wasAutoFetchEligible) {
       this.autoFetchAttempted = false;
     }
     this.wasAutoFetchEligible = eligible;
-    if (!this.autoFetchAttempted && this.shouldAutoFetch()) {
+    if (eligible && !this.autoFetchAttempted) {
       this.autoFetchAttempted = true;
-      void this.runFetch({ cancelRefetch: false }).catch(() => void 0);
+      if (this.shouldAutoFetch()) {
+        void this.runFetch({ cancelRefetch: false }).catch(() => void 0);
+      }
     }
     this.configureTimers();
   }
-  commit(manageEnvironment = true) {
-    this.applyOptions();
-    this.hasCommit = true;
-    if (!this.isRestoring && this.options.subscribed !== false && !this.lease) {
-      this.lease = true;
-      this.hub.retain(this.query, this.options.gcTime);
+  updateCommittedOptions(options, isRestoring) {
+    try {
+      this.committedOptions = options;
+      this.committedIsRestoring = isRestoring;
+      this.commitRenderResult();
+      this.applyOptions(options);
+      if (this.hasCommit) {
+        this.syncLease();
+        this.hub.noteGcTime(this.query, options.gcTime);
+        this.configureTimers();
+      }
+    } catch (error) {
+      this.release();
+      throw error;
     }
-    this.hub.noteGcTime(this.query, this.options.gcTime);
-    this.environmentRelease?.();
-    this.environmentRelease = void 0;
-    if (!this.isRestoring && manageEnvironment && this.options.subscribed !== false) {
-      const environment = {
-        onFocus: () => this.triggerRefetch(this.options.refetchOnWindowFocus),
-        onOnline: () => this.triggerRefetch(this.options.refetchOnReconnect)
-      };
-      this.environmentRelease = this.hub.registerEnvironment(environment);
+  }
+  commit(options = this.options, isRestoring = this.isRestoring, manageEnvironment = true) {
+    try {
+      this.updateCommittedOptions(options, isRestoring);
+      this.hasCommit = true;
+      this.syncLease();
+      this.hub.noteGcTime(this.query, options.gcTime);
+      this.environmentRelease?.();
+      this.environmentRelease = void 0;
+      if (!isRestoring && manageEnvironment && options.subscribed !== false) {
+        const environment = {
+          onFocus: () => this.triggerRefetch(this.committedOptions.refetchOnWindowFocus),
+          onOnline: () => this.triggerRefetch(this.committedOptions.refetchOnReconnect)
+        };
+        this.environmentRelease = this.hub.registerEnvironment(environment);
+      }
+      this.configureTimers();
+    } catch (error) {
+      this.release();
+      throw error;
     }
-    this.configureTimers();
+  }
+  syncLease() {
+    const shouldRetain = this.hasCommit && !this.committedIsRestoring && this.committedOptions.subscribed !== false;
+    if (shouldRetain && !this.lease) {
+      try {
+        this.updateQuerySemantics();
+        this.hub.retain(this.query, this.committedOptions.gcTime);
+        this.lease = true;
+      } catch (error) {
+        this.hub.clearQuerySemantics(this.querySemanticsKey);
+        throw error;
+      }
+    } else if (shouldRetain) {
+      this.updateQuerySemantics();
+    } else if (!shouldRetain && this.lease) {
+      this.lease = false;
+      try {
+        this.hub.clearQuerySemantics(this.querySemanticsKey);
+      } finally {
+        this.hub.release(this.query);
+      }
+    }
   }
   release() {
     this.hasCommit = false;
@@ -915,30 +1398,35 @@ var LiteQueryEntry = class {
     this.hub.cancelInterval(this.intervalTimerKey);
     if (this.lease) {
       this.lease = false;
-      this.hub.release(this.query);
+      try {
+        this.hub.clearQuerySemantics(this.querySemanticsKey);
+      } finally {
+        this.hub.release(this.query);
+      }
     }
   }
   configureTimers() {
-    if (!this.hasCommit || this.isRestoring || this.options.subscribed === false) {
+    const options = this.committedOptions;
+    if (!this.hasCommit || this.committedIsRestoring || options.subscribed === false) {
       this.hub.cancelStale(this.staleTimerKey);
       this.hub.cancelInterval(this.intervalTimerKey);
       return;
     }
-    const interval = resolveInterval(this.options.refetchInterval, this.query);
+    const interval = resolveInterval(options.refetchInterval, this.query);
     if (isValidTimeout(interval) && interval > 0) {
       this.hub.scheduleInterval(this.intervalTimerKey, {
         interval,
         callback: () => {
-          if (!this.hasCommit || !isEnabled(this.options, this.query) || isSkipped(this.options) || this.options.refetchIntervalInBackground !== true && !focusManager.isFocused()) return;
+          if (!this.hasCommit || !isEnabled(this.committedOptions, this.query) || isSkipped(this.committedOptions) || this.committedOptions.refetchIntervalInBackground !== true && !focusManager.isFocused()) return;
           void this.runFetch({ cancelRefetch: false }).catch(() => void 0);
         },
-        inBackground: () => this.options.refetchIntervalInBackground === true || focusManager.isFocused()
+        inBackground: () => this.committedOptions.refetchIntervalInBackground === true || focusManager.isFocused()
       });
     } else {
       this.hub.cancelInterval(this.intervalTimerKey);
     }
-    const staleTime = resolveStaleTime2(this.options.staleTime, this.query);
-    const configuredNotify = typeof this.options.notifyOnChangeProps === "function" ? this.options.notifyOnChangeProps() : this.options.notifyOnChangeProps;
+    const staleTime = resolveStaleTime2(options.staleTime, this.query);
+    const configuredNotify = typeof options.notifyOnChangeProps === "function" ? options.notifyOnChangeProps() : options.notifyOnChangeProps;
     const tracksStale = configuredNotify === "all" || Array.isArray(configuredNotify) && configuredNotify.includes("isStale") || this.trackedProps.has("isStale");
     if (tracksStale && this.query.state.data !== void 0 && typeof staleTime === "number" && isValidTimeout(staleTime) && !this.query.state.isInvalidated) {
       this.hub.scheduleStale(
@@ -951,14 +1439,20 @@ var LiteQueryEntry = class {
     }
   }
   triggerRefetch(setting) {
-    if (!this.hasCommit || this.isRestoring || this.options.subscribed === false || !isEnabled(this.options, this.query) || isSkipped(this.options)) return;
+    const options = this.committedOptions;
+    if (!this.hasCommit || this.committedIsRestoring || options.subscribed === false || !isEnabled(options, this.query) || isSkipped(options)) return;
     const policy = resolveRefetchPolicy(setting, this.query);
     if (policy === false) return;
-    if (policy !== "always" && !isStale(this.options, this.query)) return;
+    if (policy !== "always" && !isStale(options, this.query)) return;
     void this.runFetch({ cancelRefetch: false }).catch(() => void 0);
   }
+  triggerEnvironment(setting) {
+    this.triggerRefetch(
+      setting === "focus" ? this.committedOptions.refetchOnWindowFocus : this.committedOptions.refetchOnReconnect
+    );
+  }
   refetch = async (refetchOptions) => {
-    if (isSkipped(this.options)) {
+    if (isSkipped(this.committedOptions)) {
       throw new Error(`Missing queryFn: '${this.hash}'`);
     }
     const fetchOptions = {
@@ -967,30 +1461,34 @@ var LiteQueryEntry = class {
     try {
       await this.runFetch(fetchOptions);
     } catch (error) {
-      if (refetchOptions?.throwOnError || isSkipped(this.options)) throw error;
+      if (refetchOptions?.throwOnError || isSkipped(this.committedOptions)) throw error;
     }
-    return this.snapshot();
+    const next = this.computeCommittedResult();
+    this.syncRenderResultFromCommitted(next);
+    return next;
   };
 };
 function useEntry(options, client, isRestoring) {
   "use no memo";
   const hub = getLiteHub(client);
   const currentQuery = hub.buildQuery(options);
-  const previous = useRef(void 0);
+  const committed = useRef(void 0);
   const entry = useMemo(
-    () => new LiteQueryEntry(client, hub, options, previous.current, currentQuery),
+    () => new LiteQueryEntry(client, hub, options, committed.current, currentQuery),
     [client, currentQuery]
   );
   entry.update(options, isRestoring);
-  previous.current = entry;
-  return entry;
+  const markCommitted = useCallback(() => {
+    committed.current = entry;
+  }, [entry]);
+  return [entry, markCommitted];
 }
 function useQueryLite(options, explicitClient) {
   "use no memo";
   const client = useQueryClient(explicitClient);
   const isRestoring = useIsRestoring();
   const defaulted = client.defaultQueryOptions(options);
-  const entry = useEntry(defaulted, client, isRestoring);
+  const [entry, markEntryCommitted] = useEntry(defaulted, client, isRestoring);
   const subscribed = defaulted.subscribed !== false && !isRestoring;
   const subscribe = useCallback(
     (listener) => entry.subscribe(listener),
@@ -999,14 +1497,18 @@ function useQueryLite(options, explicitClient) {
   const getSnapshot = useCallback(() => entry.snapshot(), [entry]);
   const result = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   useLayoutEffect(() => {
-    entry.commit();
+    entry.updateCommittedOptions(defaulted, isRestoring);
+  });
+  useLayoutEffect(() => {
+    entry.commit(defaulted, isRestoring);
+    markEntryCommitted();
     return () => entry.release();
-  }, [entry, subscribed]);
+  }, [entry, subscribed, isRestoring, markEntryCommitted]);
   useEffect(() => {
     if (defaulted.experimental_prefetchInRender) {
       warnUnsupportedOption("experimental_prefetchInRender");
     }
-    entry.afterCommit();
+    entry.afterCommit(defaulted, isRestoring);
   });
   const rawResult = entry.rawSnapshot();
   if (shouldLiteThrowError(rawResult, defaulted, entry.query)) throw rawResult.error;
@@ -1021,6 +1523,13 @@ function createAggregateRuntime(client, hub) {
     options: {},
     previousSnapshot: void 0,
     previousItems: [],
+    committedEntries: [],
+    committedHashIndexes: /* @__PURE__ */ new Map(),
+    committedEntryIndexes: /* @__PURE__ */ new Map(),
+    committedSnapshot: void 0,
+    committedItems: [],
+    committedDirtyIndexes: /* @__PURE__ */ new Set(),
+    committedCombine: void 0,
     dirtyIndexes: /* @__PURE__ */ new Set(),
     previousCombine: void 0,
     releaseEntries: [],
@@ -1030,6 +1539,7 @@ function createAggregateRuntime(client, hub) {
     notifyListener: void 0,
     processingCacheEvent: false,
     subscribed: true,
+    committedSubscribed: true,
     committed: false,
     subscribe(listener) {
       if (!runtime.subscribed) return () => void 0;
@@ -1043,9 +1553,9 @@ function createAggregateRuntime(client, hub) {
         }
         runtime.notifyIfChanged();
       };
-      runtime.attachResultListeners();
+      runtime.syncCommitted();
       const releaseAggregate = runtime.hub.subscribeAggregate(
-        runtime.entries.map((entry) => entry.hash),
+        runtime.committedEntries.map((entry) => entry.hash),
         runtime.aggregateListener
       );
       return () => {
@@ -1077,12 +1587,6 @@ function createAggregateRuntime(client, hub) {
         runtime.previousCombine = options.combine;
         for (let index = 0; index < entries.length; index++) runtime.dirtyIndexes.add(index);
       }
-      if (runtime.committed) {
-        if (runtime.aggregateListener) {
-          runtime.hub.updateAggregate(entries.map((entry) => entry.hash), runtime.aggregateListener);
-        }
-        runtime.attachResultListeners();
-      }
     },
     snapshot() {
       if (runtime.previousSnapshot !== void 0 && runtime.dirtyIndexes.size === 0) {
@@ -1100,26 +1604,47 @@ function createAggregateRuntime(client, hub) {
     },
     commit() {
       runtime.committed = true;
+      runtime.committedSubscribed = runtime.subscribed;
+      const previousReleaseEntries = runtime.releaseEntries;
       const next = new Set(runtime.entries);
       for (const entry of runtime.releaseEntries) {
         if (!next.has(entry)) entry.release();
       }
-      if (!runtime.subscribed) {
+      if (!runtime.committedSubscribed) {
         for (const entry of runtime.releaseEntries) entry.release();
         runtime.releaseEntries = [];
         runtime.environmentRelease?.();
         runtime.environmentRelease = void 0;
-        runtime.attachResultListeners();
+        runtime.syncCommitted();
         return;
       }
-      runtime.releaseEntries = [...runtime.entries];
-      for (const entry of runtime.entries) entry.commit(false);
-      runtime.attachResultListeners();
-      runtime.environmentRelease?.();
-      runtime.environmentRelease = runtime.hub.registerEnvironment({
-        onFocus: () => runtime.onEnvironment("focus"),
-        onOnline: () => runtime.onEnvironment("online")
-      });
+      const nextReleaseEntries = [];
+      try {
+        for (const entry of runtime.entries) {
+          nextReleaseEntries.push(entry);
+          entry.commit(entry.options, runtime.options.isRestoring === true, false);
+        }
+        runtime.syncCommitted();
+        runtime.environmentRelease?.();
+        runtime.environmentRelease = runtime.hub.registerEnvironment({
+          onFocus: () => runtime.onEnvironment("focus"),
+          onOnline: () => runtime.onEnvironment("online")
+        });
+      } catch (error) {
+        runtime.environmentRelease?.();
+        runtime.environmentRelease = void 0;
+        for (let index = nextReleaseEntries.length - 1; index >= 0; index--) {
+          nextReleaseEntries[index].release();
+        }
+        for (let index = previousReleaseEntries.length - 1; index >= 0; index--) {
+          previousReleaseEntries[index].release();
+        }
+        runtime.releaseEntries = [];
+        runtime.committed = false;
+        runtime.committedSubscribed = false;
+        throw error;
+      }
+      runtime.releaseEntries = nextReleaseEntries;
     },
     release() {
       runtime.committed = false;
@@ -1131,39 +1656,79 @@ function createAggregateRuntime(client, hub) {
       runtime.releaseEntries = [];
     },
     onEnvironment(setting) {
-      if (!runtime.subscribed) return;
-      for (const entry of runtime.entries) {
-        entry.triggerRefetch(setting === "focus" ? entry.options.refetchOnWindowFocus : entry.options.refetchOnReconnect);
-      }
+      if (!runtime.committedSubscribed) return;
+      for (const entry of runtime.committedEntries) entry.triggerEnvironment(setting);
     },
     onCacheEvent(hash, event) {
-      const indexes = runtime.hashIndexes.get(hash);
+      const indexes = runtime.committedHashIndexes.get(hash);
       if (!indexes || indexes.length === 0) return;
       for (const index of indexes) {
-        const entry = runtime.entries[index];
-        if (entry.options.subscribed === false) continue;
-        if (entry.onCacheEvent(event)) runtime.dirtyIndexes.add(index);
+        const entry = runtime.committedEntries[index];
+        if (!entry.isCommittedSubscribed()) continue;
+        if (entry.onCacheEvent(event)) {
+          runtime.committedItems[index] = entry.snapshot();
+          runtime.committedDirtyIndexes.add(index);
+          runtime.dirtyIndexes.add(index);
+        }
       }
     },
     notifyIfChanged() {
-      if (runtime.dirtyIndexes.size === 0 || !runtime.notifyListener) return;
-      const previous = runtime.previousSnapshot;
-      const next = runtime.snapshot();
+      if (runtime.committedDirtyIndexes.size === 0 || !runtime.notifyListener) return;
+      const previous = runtime.committedSnapshot;
+      const next = runtime.committedCombine ? runtime.committedCombine(runtime.committedItems) : runtime.committedItems.slice();
+      runtime.committedSnapshot = next;
+      runtime.committedDirtyIndexes.clear();
       if (next !== previous) runtime.notifyListener();
     },
     attachResultListeners() {
       for (const release of runtime.resultReleases) release();
-      runtime.resultReleases = runtime.subscribed ? [...new Set(runtime.entries)].filter((entry) => entry.options.subscribed !== false).map(
+      runtime.resultReleases = runtime.committedSubscribed ? [...new Set(runtime.committedEntries)].filter((entry) => entry.isCommittedSubscribed()).map(
         (entry) => entry.addResultListener(() => {
-          for (const index of runtime.hashIndexes.get(entry.hash) ?? []) {
+          for (const index of runtime.committedEntryIndexes.get(entry) ?? []) {
+            runtime.committedItems[index] = entry.snapshot();
+            runtime.committedDirtyIndexes.add(index);
             runtime.dirtyIndexes.add(index);
           }
           if (!runtime.processingCacheEvent) runtime.notifyIfChanged();
         })
       ) : [];
+    },
+    syncCommitted() {
+      runtime.committedSubscribed = runtime.subscribed;
+      runtime.committedEntries = runtime.entries;
+      runtime.committedHashIndexes = /* @__PURE__ */ new Map();
+      runtime.committedEntryIndexes = /* @__PURE__ */ new Map();
+      runtime.committedEntries.forEach((entry, index) => {
+        const indexes = runtime.committedHashIndexes.get(entry.hash);
+        if (indexes) indexes.push(index);
+        else runtime.committedHashIndexes.set(entry.hash, [index]);
+        const entryIndexes = runtime.committedEntryIndexes.get(entry);
+        if (entryIndexes) entryIndexes.push(index);
+        else runtime.committedEntryIndexes.set(entry, [index]);
+      });
+      runtime.committedItems = runtime.previousItems.slice();
+      runtime.committedSnapshot = runtime.previousSnapshot;
+      runtime.committedCombine = runtime.options.combine;
+      runtime.committedDirtyIndexes.clear();
+      if (runtime.aggregateListener) {
+        runtime.hub.updateAggregate(
+          runtime.committedEntries.map((entry) => entry.hash),
+          runtime.aggregateListener
+        );
+      }
+      runtime.attachResultListeners();
     }
   };
   return runtime;
+}
+function useEntryLifecycleIdentity(entries) {
+  "use no memo";
+  const committed = useRef(entries);
+  const identity = committed.current.length === entries.length && committed.current.every((entry, index) => entry === entries[index]) ? committed.current : entries;
+  const markCommitted = useCallback(() => {
+    committed.current = identity;
+  }, [identity]);
+  return [identity, markCommitted];
 }
 function useQueriesLite(options, explicitClient) {
   "use no memo";
@@ -1177,11 +1742,8 @@ function useQueriesLite(options, explicitClient) {
   );
   const hub = getLiteHub(client);
   const previousEntriesState = useRef(void 0);
-  if (!previousEntriesState.current || previousEntriesState.current.client !== client) {
-    previousEntriesState.current = { client, entries: [] };
-  }
   const entries = useMemo(() => {
-    const previousEntries = previousEntriesState.current.entries;
+    const previousEntries = previousEntriesState.current?.client === client ? previousEntriesState.current.entries : [];
     const previousByHash = /* @__PURE__ */ new Map();
     for (let index = previousEntries.length - 1; index >= 0; index -= 1) {
       const entry = previousEntries[index];
@@ -1198,8 +1760,11 @@ function useQueriesLite(options, explicitClient) {
       return entry;
     });
   }, [client, defaultedQueries, hub, isRestoring]);
-  previousEntriesState.current.entries = entries;
-  const runtime = useMemo(() => createAggregateRuntime(client, hub), [client, hub]);
+  const [lifecycleEntries, markLifecycleCommitted] = useEntryLifecycleIdentity(entries);
+  const runtime = useMemo(
+    () => createAggregateRuntime(client, hub),
+    [client, hub, lifecycleEntries]
+  );
   runtime.update(entries, { ...options, isRestoring });
   const subscribe = useCallback(
     (listener) => runtime.subscribe(listener),
@@ -1208,16 +1773,31 @@ function useQueriesLite(options, explicitClient) {
   const getSnapshot = useCallback(() => runtime.snapshot(), [runtime]);
   const result = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   useLayoutEffect(() => {
+    entries.forEach((entry, index) => {
+      entry.updateCommittedOptions(defaultedQueries[index], isRestoring);
+    });
+    runtime.syncCommitted();
+  }, [
+    runtime,
+    entries,
+    defaultedQueries,
+    isRestoring,
+    options.combine,
+    options.subscribed
+  ]);
+  useLayoutEffect(() => {
     runtime.commit();
+    markLifecycleCommitted();
+    previousEntriesState.current = { client, entries: lifecycleEntries };
     return () => runtime.release();
-  }, [runtime, entries, options.subscribed, isRestoring]);
+  }, [runtime, lifecycleEntries, options.subscribed, isRestoring, client, markLifecycleCommitted]);
   useEffect(() => {
-    for (const entry of entries) {
+    entries.forEach((entry, index) => {
       if (entry.options.experimental_prefetchInRender) {
         warnUnsupportedOption("experimental_prefetchInRender");
       }
-      entry.afterCommit();
-    }
+      entry.afterCommit(defaultedQueries[index], isRestoring);
+    });
   });
   return result;
 }
@@ -1228,7 +1808,7 @@ function useSuspenseQueryLite(options, queryClient) {
   const defaulted = defaultSuspenseOptions(
     client.defaultQueryOptions(options)
   );
-  const entry = useEntry(defaulted, client, isRestoring);
+  const [entry, markEntryCommitted] = useEntry(defaulted, client, isRestoring);
   const subscribed = defaulted.subscribed !== false && !isRestoring;
   const subscribe = useCallback(
     (listener) => entry.subscribe(listener),
@@ -1238,14 +1818,18 @@ function useSuspenseQueryLite(options, queryClient) {
   const result = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   const pending = entry.startFetchInRender();
   useLayoutEffect(() => {
-    entry.commit();
+    entry.updateCommittedOptions(defaulted, isRestoring);
+  });
+  useLayoutEffect(() => {
+    entry.commit(defaulted, isRestoring);
+    markEntryCommitted();
     return () => entry.release();
-  }, [entry, subscribed]);
+  }, [entry, subscribed, isRestoring, markEntryCommitted]);
   useEffect(() => {
     if (defaulted.experimental_prefetchInRender) {
       warnUnsupportedOption("experimental_prefetchInRender");
     }
-    entry.afterCommit();
+    entry.afterCommit(defaulted, isRestoring);
   });
   if ((isRestoring || defaulted.subscribed === false) && entry.query.state.data === void 0) throw pausedSuspensePromise;
   if (pending) throw pending;
@@ -1265,11 +1849,8 @@ function useSuspenseQueriesLite(options, explicitClient) {
   );
   const hub = getLiteHub(client);
   const previousEntriesState = useRef(void 0);
-  if (!previousEntriesState.current || previousEntriesState.current.client !== client) {
-    previousEntriesState.current = { client, entries: [] };
-  }
   const entries = useMemo(() => {
-    const previousEntries = previousEntriesState.current.entries;
+    const previousEntries = previousEntriesState.current?.client === client ? previousEntriesState.current.entries : [];
     const previousByHash = /* @__PURE__ */ new Map();
     for (let index = previousEntries.length - 1; index >= 0; index -= 1) {
       const entry = previousEntries[index];
@@ -1286,8 +1867,11 @@ function useSuspenseQueriesLite(options, explicitClient) {
       return entry;
     });
   }, [client, defaultedQueries, hub, isRestoring]);
-  previousEntriesState.current.entries = entries;
-  const runtime = useMemo(() => createAggregateRuntime(client, hub), [client, hub]);
+  const [lifecycleEntries, markLifecycleCommitted] = useEntryLifecycleIdentity(entries);
+  const runtime = useMemo(
+    () => createAggregateRuntime(client, hub),
+    [client, hub, lifecycleEntries]
+  );
   runtime.update(entries, { ...options, isRestoring });
   const aggregateSubscribed = options.subscribed !== false && !isRestoring;
   const subscribe = useCallback(
@@ -1298,16 +1882,31 @@ function useSuspenseQueriesLite(options, explicitClient) {
   const result = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   const pending = entries.map((entry) => entry.startFetchInRender()).filter((promise) => promise !== void 0);
   useLayoutEffect(() => {
+    entries.forEach((entry, index) => {
+      entry.updateCommittedOptions(defaultedQueries[index], isRestoring);
+    });
+    runtime.syncCommitted();
+  }, [
+    runtime,
+    entries,
+    defaultedQueries,
+    isRestoring,
+    options.combine,
+    options.subscribed
+  ]);
+  useLayoutEffect(() => {
     runtime.commit();
+    markLifecycleCommitted();
+    previousEntriesState.current = { client, entries: lifecycleEntries };
     return () => runtime.release();
-  }, [runtime, entries, aggregateSubscribed]);
+  }, [runtime, lifecycleEntries, aggregateSubscribed, client, markLifecycleCommitted]);
   useEffect(() => {
-    for (const entry of entries) {
+    entries.forEach((entry, index) => {
       if (entry.options.experimental_prefetchInRender) {
         warnUnsupportedOption("experimental_prefetchInRender");
       }
-      entry.afterCommit();
-    }
+      entry.afterCommit(defaultedQueries[index], isRestoring);
+    });
   });
   if ((isRestoring || entries.some((entry) => entry.options.subscribed === false)) && entries.some((entry) => entry.query.state.data === void 0)) throw pausedSuspensePromise;
   if (pending.length > 0) throw Promise.all(pending);
@@ -1404,8 +2003,32 @@ function resetMemoryForQuery(memory, query) {
   memory.promise = void 0;
   memory.promiseData = void 0;
 }
-function updateResult(runtime, refetch, fetchNextPage, fetchPreviousPage) {
-  const { query, options, memory } = runtime;
+function cloneInfiniteMemory(memory) {
+  const clone = {
+    selectState: { ...memory.selectState },
+    // property access は commit 後にも起こるため、追加方向だけの tracking set は共有する。
+    // select と result の比較基準だけを分離し、破棄 render による通知抑制を防ぐ。
+    trackedProps: memory.trackedProps
+  };
+  if (memory.query !== void 0) clone.query = memory.query;
+  if (memory.queryInitialState !== void 0) {
+    clone.queryInitialState = memory.queryInitialState;
+  }
+  if (memory.previousResult !== void 0) {
+    clone.previousResult = memory.previousResult;
+  }
+  if (memory.previousResultState !== void 0) {
+    clone.previousResultState = memory.previousResultState;
+  }
+  if (memory.previousResultOptions !== void 0) {
+    clone.previousResultOptions = memory.previousResultOptions;
+  }
+  if (memory.promise !== void 0) clone.promise = memory.promise;
+  if (memory.promiseData !== void 0) clone.promiseData = memory.promiseData;
+  return clone;
+}
+function updateResult(runtime, refetch, fetchNextPage, fetchPreviousPage, options = runtime.options, isRestoring = runtime.isRestoring, memory = runtime.memory) {
+  const { query } = runtime;
   resetMemoryForQuery(memory, query);
   if (memory.selectState.selectFn !== options.select) {
     memory.selectState = {
@@ -1414,7 +2037,7 @@ function updateResult(runtime, refetch, fetchNextPage, fetchPreviousPage) {
       selectError: null
     };
   }
-  const useOptimisticFetchState = !runtime.autoFetchAttempted && !runtime.isRestoring && options.subscribed !== false && query.state.status === "pending" && query.state.fetchStatus === "idle" && resolveEnabled(options.enabled, query) !== false && options.queryFn !== skipToken;
+  const useOptimisticFetchState = !runtime.autoFetchAttempted && !isRestoring && options.subscribed !== false && query.state.status === "pending" && query.state.fetchStatus === "idle" && resolveEnabled(options.enabled, query) !== false && options.queryFn !== skipToken;
   const context = {
     query,
     state: useOptimisticFetchState ? { ...query.state, fetchStatus: "fetching" } : query.state,
@@ -1438,7 +2061,8 @@ function updateResult(runtime, refetch, fetchNextPage, fetchPreviousPage) {
   });
 }
 function runFetch(runtime, fetchOptions, direction) {
-  const { hub, query, options } = runtime;
+  const { hub, query } = runtime;
+  const options = runtime.committedOptions;
   const queryFetchOptions = direction ? {
     ...fetchOptions,
     cancelRefetch: fetchOptions.cancelRefetch ?? true,
@@ -1482,12 +2106,18 @@ function useInfiniteRuntime(options, explicitClient) {
       hub,
       query,
       options: defaultedOptions,
+      committedOptions: defaultedOptions,
       memory,
+      committedMemory: cloneInfiniteMemory(memory),
       result: void 0,
       listener: void 0,
       autoFetchAttempted: false,
       wasAutoFetchEligible: false,
-      isRestoring
+      isRestoring,
+      committedIsRestoring: isRestoring,
+      invalidationFetchScheduled: false,
+      querySemanticsKey: {},
+      retainedQuery: void 0
     }),
     [client, hub, memory, query]
   );
@@ -1501,18 +2131,25 @@ function useInfiniteRuntime(options, explicitClient) {
     }),
     [runtime]
   );
-  const makeResult = useCallback(() => {
+  const makeResult = useCallback((resultOptions = runtime.options, resultIsRestoring = runtime.isRestoring, resultMemory = runtime.memory) => {
     const next = updateResult(
       runtime,
       actions.refetch,
       actions.fetchNextPage,
-      actions.fetchPreviousPage
+      actions.fetchPreviousPage,
+      resultOptions,
+      resultIsRestoring,
+      resultMemory
     );
     runtime.result = next;
     runtime.snapshot = next;
     return next;
   }, [actions, runtime]);
-  runtime.refresh = makeResult;
+  runtime.refresh = () => makeResult(
+    runtime.committedOptions,
+    runtime.committedIsRestoring,
+    runtime.committedMemory
+  );
   makeResult();
   const subscribe = useCallback(
     (onStoreChange) => {
@@ -1522,70 +2159,147 @@ function useInfiniteRuntime(options, explicitClient) {
       runtime.listener = onStoreChange;
       let subscribedQuery = query;
       let rebinding = false;
-      hub.retain(subscribedQuery, defaultedOptions.gcTime);
+      let retained = false;
+      const retainQuery = (target) => {
+        runtime.retainedQuery = target;
+        try {
+          hub.setQuerySemantics(target, runtime.querySemanticsKey, {
+            isActive: () => runtime.retainedQuery === target && resolveEnabled(runtime.committedOptions.enabled, target) !== false && runtime.committedOptions.queryFn !== skipToken,
+            isStatic: () => runtime.retainedQuery === target && resolveStaleTime3(runtime.committedOptions.staleTime, target) === "static",
+            mayBeStatic: typeof runtime.committedOptions.staleTime === "function" || runtime.committedOptions.staleTime === "static"
+          });
+          hub.retain(target, defaultedOptions.gcTime);
+        } catch (error) {
+          hub.clearQuerySemantics(runtime.querySemanticsKey);
+          if (runtime.retainedQuery === target) runtime.retainedQuery = void 0;
+          throw error;
+        }
+      };
+      const releaseRetention = () => {
+        try {
+          hub.clearQuerySemantics(runtime.querySemanticsKey);
+        } finally {
+          if (retained) hub.release(subscribedQuery);
+          retained = false;
+          if (runtime.retainedQuery === subscribedQuery) {
+            runtime.retainedQuery = void 0;
+          }
+        }
+      };
+      try {
+        retainQuery(subscribedQuery);
+        retained = true;
+      } catch (error) {
+        if (runtime.listener === onStoreChange) runtime.listener = void 0;
+        throw error;
+      }
       const switchQuery = (nextQuery) => {
         if (nextQuery === subscribedQuery) return;
-        hub.release(subscribedQuery);
+        try {
+          hub.clearQuerySemantics(runtime.querySemanticsKey);
+        } finally {
+          if (retained) hub.release(subscribedQuery);
+        }
+        retained = false;
         subscribedQuery = nextQuery;
-        hub.retain(subscribedQuery, defaultedOptions.gcTime);
+        retainQuery(subscribedQuery);
+        retained = true;
         runtime.query = subscribedQuery;
         runtime.autoFetchAttempted = false;
         runtime.wasAutoFetchEligible = false;
         resetMemoryForQuery(runtime.memory, subscribedQuery);
+        resetMemoryForQuery(runtime.committedMemory, subscribedQuery);
       };
-      const unsubscribeHash = hub.subscribeHash(query.queryHash, (event) => {
-        if (rebinding) return;
-        if (event.type === "removed" && event.query === subscribedQuery) {
-          rebinding = true;
-          try {
-            switchQuery(hub.buildQuery(runtime.options));
-          } finally {
-            rebinding = false;
+      let unsubscribeHash;
+      try {
+        unsubscribeHash = hub.subscribeHash(query.queryHash, (event) => {
+          if (rebinding) return;
+          if (event.type === "removed" && event.query === subscribedQuery) {
+            rebinding = true;
+            try {
+              switchQuery(hub.buildQuery(runtime.committedOptions));
+            } finally {
+              rebinding = false;
+            }
+          } else if (event.query !== subscribedQuery) {
+            switchQuery(event.query);
           }
-        } else if (event.query !== subscribedQuery) {
-          switchQuery(event.query);
-        }
-        if (runtime.query !== subscribedQuery) return;
-        const previous = runtime.memory.previousResult;
-        makeResult();
-        const next = runtime.memory.previousResult;
-        if (liteResultChanged(
-          next,
-          previous,
-          runtime.options.notifyOnChangeProps,
-          runtime.memory.trackedProps,
-          runtime.options.throwOnError
-        )) {
-          runtime.listener?.();
-        }
-        if (event.type === "updated" && event.action.type === "invalidate" && resolveEnabled(runtime.options.enabled, subscribedQuery) !== false && runtime.options.queryFn !== skipToken) {
-          void subscribedQuery.fetch(runtime.options, { cancelRefetch: false }).catch(() => void 0);
-        }
-      });
-      const unregisterEnvironment = hub.registerEnvironment({
-        onFocus: () => {
-          if (shouldFetchOnEnvironment(
-            subscribedQuery,
-            runtime.options,
-            runtime.options.refetchOnWindowFocus
+          if (runtime.query !== subscribedQuery) return;
+          const previous = runtime.committedMemory.previousResult;
+          makeResult(
+            runtime.committedOptions,
+            runtime.committedIsRestoring,
+            runtime.committedMemory
+          );
+          const next = runtime.committedMemory.previousResult;
+          if (liteResultChanged(
+            next,
+            previous,
+            runtime.committedOptions.notifyOnChangeProps,
+            runtime.memory.trackedProps,
+            runtime.committedOptions.throwOnError
           )) {
-            void subscribedQuery.fetch(runtime.options, { cancelRefetch: false }).catch(() => void 0);
+            runtime.listener?.();
           }
-        },
-        onOnline: () => {
-          if (shouldFetchOnEnvironment(
-            subscribedQuery,
-            runtime.options,
-            runtime.options.refetchOnReconnect
-          )) {
-            void subscribedQuery.fetch(runtime.options, { cancelRefetch: false }).catch(() => void 0);
+          if (event.type === "updated" && event.action.type === "invalidate" && resolveEnabled(runtime.committedOptions.enabled, subscribedQuery) !== false && runtime.committedOptions.queryFn !== skipToken && resolveStaleTime3(runtime.committedOptions.staleTime, subscribedQuery) !== "static" && !subscribedQuery.isActive()) {
+            const handled = hub.runActiveInvalidation(
+              subscribedQuery,
+              (fetchOptions) => subscribedQuery.fetch(
+                runtime.committedOptions,
+                fetchOptions
+              )
+            );
+            if (handled === void 0 && !runtime.invalidationFetchScheduled) {
+              const invalidatedQuery = subscribedQuery;
+              runtime.invalidationFetchScheduled = true;
+              queueMicrotask(() => {
+                runtime.invalidationFetchScheduled = false;
+                if (runtime.listener === void 0 || runtime.committedIsRestoring || runtime.committedOptions.subscribed === false || runtime.query !== invalidatedQuery || resolveEnabled(runtime.committedOptions.enabled, invalidatedQuery) === false || runtime.committedOptions.queryFn === skipToken || resolveStaleTime3(
+                  runtime.committedOptions.staleTime,
+                  invalidatedQuery
+                ) === "static" || invalidatedQuery.isActive() || invalidatedQuery.state.fetchStatus !== "idle" || !invalidatedQuery.state.isInvalidated) return;
+                void invalidatedQuery.fetch(runtime.committedOptions, { cancelRefetch: false }).catch(() => void 0);
+              });
+            }
           }
-        }
-      });
+        });
+      } catch (error) {
+        releaseRetention();
+        if (runtime.listener === onStoreChange) runtime.listener = void 0;
+        throw error;
+      }
+      let unregisterEnvironment;
+      try {
+        unregisterEnvironment = hub.registerEnvironment({
+          onFocus: () => {
+            if (shouldFetchOnEnvironment(
+              subscribedQuery,
+              runtime.committedOptions,
+              runtime.committedOptions.refetchOnWindowFocus
+            )) {
+              void subscribedQuery.fetch(runtime.committedOptions, { cancelRefetch: false }).catch(() => void 0);
+            }
+          },
+          onOnline: () => {
+            if (shouldFetchOnEnvironment(
+              subscribedQuery,
+              runtime.committedOptions,
+              runtime.committedOptions.refetchOnReconnect
+            )) {
+              void subscribedQuery.fetch(runtime.committedOptions, { cancelRefetch: false }).catch(() => void 0);
+            }
+          }
+        });
+      } catch (error) {
+        unsubscribeHash();
+        releaseRetention();
+        if (runtime.listener === onStoreChange) runtime.listener = void 0;
+        throw error;
+      }
       return () => {
         unsubscribeHash();
         unregisterEnvironment();
-        hub.release(subscribedQuery);
+        releaseRetention();
         if (runtime.listener === onStoreChange) {
           runtime.listener = void 0;
         }
@@ -1605,6 +2319,23 @@ function useInfiniteRuntime(options, explicitClient) {
     [makeResult, runtime]
   );
   useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  useLayoutEffect(() => {
+    runtime.committedOptions = defaultedOptions;
+    runtime.committedIsRestoring = isRestoring;
+    runtime.committedMemory = cloneInfiniteMemory(runtime.memory);
+    query.setOptions(defaultedOptions);
+    if (runtime.retainedQuery) {
+      hub.setQuerySemantics(
+        runtime.retainedQuery,
+        runtime.querySemanticsKey,
+        {
+          isActive: () => runtime.retainedQuery !== void 0 && resolveEnabled(runtime.committedOptions.enabled, runtime.retainedQuery) !== false && runtime.committedOptions.queryFn !== skipToken,
+          isStatic: () => runtime.retainedQuery !== void 0 && resolveStaleTime3(runtime.committedOptions.staleTime, runtime.retainedQuery) === "static",
+          mayBeStatic: typeof runtime.committedOptions.staleTime === "function" || runtime.committedOptions.staleTime === "static"
+        }
+      );
+    }
+  });
   useEffect(() => {
     if (defaultedOptions.experimental_prefetchInRender) {
       warnUnsupportedOption("experimental_prefetchInRender");
@@ -1617,9 +2348,11 @@ function useInfiniteRuntime(options, explicitClient) {
     if (!eligible) {
       return;
     }
-    if (!runtime.autoFetchAttempted && shouldFetchOnMount(query, defaultedOptions)) {
+    if (!runtime.autoFetchAttempted) {
       runtime.autoFetchAttempted = true;
-      void query.fetch(defaultedOptions).catch(() => void 0);
+      if (shouldFetchOnMount(query, defaultedOptions)) {
+        void query.fetch(defaultedOptions).catch(() => void 0);
+      }
     }
   }, [
     defaultedOptions.enabled,
@@ -1639,15 +2372,19 @@ function useInfiniteRuntime(options, explicitClient) {
         query.state.dataUpdatedAt + staleTime + 1,
         () => {
           if (runtime.query !== query) return;
-          const previous = runtime.memory.previousResult;
-          makeResult();
-          const next = runtime.memory.previousResult;
+          const previous = runtime.committedMemory.previousResult;
+          makeResult(
+            runtime.committedOptions,
+            runtime.committedIsRestoring,
+            runtime.committedMemory
+          );
+          const next = runtime.committedMemory.previousResult;
           if (liteResultChanged(
             next,
             previous,
-            runtime.options.notifyOnChangeProps,
+            runtime.committedOptions.notifyOnChangeProps,
             runtime.memory.trackedProps,
-            runtime.options.throwOnError
+            runtime.committedOptions.throwOnError
           )) {
             runtime.listener?.();
           }
@@ -1664,32 +2401,31 @@ function useInfiniteRuntime(options, explicitClient) {
     query,
     runtime.memory.previousResult?.dataUpdatedAt
   ]);
+  const resolvedRefetchInterval = typeof defaultedOptions.refetchInterval === "function" ? defaultedOptions.refetchInterval(query) : defaultedOptions.refetchInterval;
   useEffect(() => {
     if (isRestoring || defaultedOptions.subscribed === false) return;
-    const interval = typeof defaultedOptions.refetchInterval === "function" ? defaultedOptions.refetchInterval(query) : defaultedOptions.refetchInterval;
+    const interval = resolvedRefetchInterval;
     if (typeof interval !== "number" || interval <= 0 || interval === Infinity) {
       hub.cancelInterval(intervalTimerKey.current);
       return () => hub.cancelInterval(intervalTimerKey.current);
     }
     hub.scheduleInterval(intervalTimerKey.current, {
       interval,
-      inBackground: () => defaultedOptions.refetchIntervalInBackground === true || focusManager.isFocused(),
+      inBackground: () => runtime.committedOptions.refetchIntervalInBackground === true || focusManager.isFocused(),
       callback: () => {
-        if (runtime.isRestoring) return;
+        if (runtime.committedIsRestoring) return;
         const currentQuery = runtime.query;
-        if (resolveEnabled(runtime.options.enabled, currentQuery) === false) return;
-        void currentQuery.fetch(runtime.options).catch(() => void 0);
+        if (resolveEnabled(runtime.committedOptions.enabled, currentQuery) === false) return;
+        void currentQuery.fetch(runtime.committedOptions).catch(() => void 0);
       }
     });
     return () => hub.cancelInterval(intervalTimerKey.current);
   }, [
-    defaultedOptions.enabled,
-    defaultedOptions.refetchInterval,
-    defaultedOptions.refetchIntervalInBackground,
     defaultedOptions.subscribed,
     hub,
     isRestoring,
-    query
+    query,
+    resolvedRefetchInterval
   ]);
   return runtime;
 }
