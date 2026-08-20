@@ -23,8 +23,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsup && tsc -p tsconfig.build.json && pnpm check:declarations && pnpm check:bundle",
-    "check": "pnpm typecheck && pnpm lint && pnpm test && pnpm check:react-compiler && pnpm build",
+    "build:dist": "tsup && tsc -p tsconfig.build.json && pnpm check:declarations && pnpm check:bundle",
+    "check": "pnpm typecheck && pnpm lint && pnpm test && pnpm check:react-compiler && pnpm build:dist",
     "check:bundle": "node scripts/check-bundle.mjs",
     "check:declarations": "tsc --ignoreConfig --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --skipLibCheck false scripts/type-consumer.ts",
     "check:react-compiler": "node scripts/check-react-compiler.mjs",

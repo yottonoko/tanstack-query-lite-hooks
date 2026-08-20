@@ -35,12 +35,14 @@ pnpm test
 pnpm check:react-compiler
 pnpm check:declarations
 pnpm check:bundle
-pnpm build
+pnpm build:dist
 ```
 
 runtime output は ESM `.mjs`、public type は `.d.ts` です。CommonJS output を追加しないでください。root entrypoint が native React adapter の不要な module を import していないことは `check:bundle` の対象です。
 
-private GitHub dependency から build step なしで利用できるように、`dist/index.mjs`、source map、TypeScript declarations は repository に含めます。package tarball には README から参照する `docs/` も含めます。source を変更した commit では `pnpm build` 後の `dist/` も同じ commit に更新してください。npm registry への publish や install 時の `prepare` script は使いません。
+private GitHub dependency から build step なしで利用できるように、`dist/index.mjs`、source map、TypeScript declarations は repository に含めます。package tarball には README から参照する `docs/` も含めます。source を変更した commit では `pnpm build:dist` 後の `dist/` も同じ commit に更新してください。npm registry への publish や install 時の `prepare` script は使いません。
+
+npm は Git dependency の `package.json` に `build` script があると、install 前に development dependency を解決して repository を再 build します。この package は commit 済みの `dist/` をそのまま配布するため、distribution build は意図的に `build:dist` という名前にしています。`build`、`prepare`、`prepack`、install lifecycle script を追加する場合は、npm の repository direct install を clean consumer で再検証してください。
 
 ## Public API の変更
 

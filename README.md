@@ -21,6 +21,13 @@ pnpm add "github:yottonoko/tanstack-query-lite-hooks#main"
 pnpm add "@tanstack/react-query@5.101.x" react react-dom
 ```
 
+同じ GitHub repository は npm からも直接指定できます。package は commit 済みの `dist/` を含むため、利用側で pnpm を導入したり source を build したりする必要はありません。
+
+```sh
+npm install "github:yottonoko/tanstack-query-lite-hooks#main"
+npm install "@tanstack/react-query@5.101.x" react react-dom
+```
+
 GitHub の SSH 認証を使う場合は、次の形式も利用できます。
 
 ```sh
@@ -163,12 +170,8 @@ native hook が取得した data を Lite hook が読めます。逆方向も同
 native helper の戻り値はそのまま Lite hook に渡せます。TypeScript 7 の const type parameter と TanStack Query の DataTag を維持するため、options を共有する時も native helper を利用してください。
 
 ```tsx
-import { queryOptions, skipToken } from '@tanstack/react-query'
-import {
-  queryOptionsLite,
-  skipTokenLite,
-  useQueryLite,
-} from 'tanstack-query-lite-hooks'
+import { queryOptions } from '@tanstack/react-query'
+import { skipTokenLite, useQueryLite } from 'tanstack-query-lite-hooks'
 
 const userOptions = queryOptions({
   queryKey: ['user', userId] as const,
@@ -258,20 +261,15 @@ import {
 Infinite Query は native `infiniteQueryOptions()` の戻り値を受け取り、native QueryCache の Infinite Query state を共有します。
 
 ```tsx
-import {
-  infiniteQueryOptions,
-} from '@tanstack/react-query'
-import {
-  infiniteQueryOptionsLite,
-  useInfiniteQueryLite,
-} from 'tanstack-query-lite-hooks'
+import { infiniteQueryOptions } from '@tanstack/react-query'
+import { useInfiniteQueryLite } from 'tanstack-query-lite-hooks'
 
-const feedOptions = infiniteQueryOptionsLite(infiniteQueryOptions({
+const feedOptions = infiniteQueryOptions({
   queryKey: ['feed'],
   queryFn: ({ pageParam, signal }) => fetchFeed(pageParam, signal),
   initialPageParam: 0,
   getNextPageParam: (lastPage) => lastPage.nextCursor,
-}))
+})
 
 function Feed() {
   const feed = useInfiniteQueryLite(feedOptions)
@@ -334,3 +332,7 @@ pnpm bench:memory
 - [Compatibility and limitations](docs/compatibility.md)
 - [Performance methodology](docs/performance.md)
 - [Development and verification](docs/development.md)
+
+## License
+
+[MIT License](LICENSE)
